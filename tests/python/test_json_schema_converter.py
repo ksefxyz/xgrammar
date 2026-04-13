@@ -631,6 +631,721 @@ def test_anyof_oneof():
     check_schema_with_instance(schema, schema_rejected, is_accepted=False, any_whitespace=False)
 
 
+def test_anyof_sibling_constraints_are_merged():
+    schema = {
+        "type": "integer",
+        "minimum": 0,
+        "anyOf": [
+            {"type": "integer", "maximum": 0},
+            {"type": "integer", "minimum": 2, "maximum": 2},
+        ],
+    }
+
+    check_schema_with_instance(schema, 0, any_whitespace=False)
+    check_schema_with_instance(schema, 2, any_whitespace=False)
+    check_schema_with_instance(schema, -1, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 1, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 3, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, json.dumps("hello"), is_accepted=False, any_whitespace=False
+    )
+
+
+def test_oneof_sibling_constraints_are_merged():
+    schema = {
+        "type": "integer",
+        "minimum": 0,
+        "oneOf": [
+            {"type": "integer", "maximum": 0},
+            {"type": "integer", "minimum": 1, "maximum": 1},
+        ],
+    }
+
+    check_schema_with_instance(schema, 0, any_whitespace=False)
+    check_schema_with_instance(schema, 1, any_whitespace=False)
+    check_schema_with_instance(schema, -1, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 2, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, json.dumps("hello"), is_accepted=False, any_whitespace=False
+    )
+
+
+def test_oneof_object_required_sets_are_exactly_one():
+    schema = {
+        "type": "object",
+        "properties": {
+            "NIP": {"type": "string"},
+            "KodUE": {"type": "string"},
+            "NrVatUE": {"type": "string"},
+        },
+        "oneOf": [
+            {"required": ["NIP"]},
+            {"required": ["KodUE", "NrVatUE"]},
+        ],
+    }
+
+    check_schema_with_instance(schema, {"NIP": "123"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"NIP": "123", "KodUE": "PL"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"KodUE": "PL", "NrVatUE": "ABC"}, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, {"KodUE": "PL"}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"NIP": "123", "KodUE": "PL", "NrVatUE": "ABC"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_oneof_object_required_sets_with_none_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "P_6": {"type": "string"},
+            "OkresFa": {"type": "string"},
+        },
+        "oneOf": [
+            {"required": ["P_6"]},
+            {"required": ["OkresFa"]},
+            {
+                "not": {
+                    "anyOf": [
+                        {"required": ["P_6"]},
+                        {"required": ["OkresFa"]},
+                    ]
+                }
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"P_6": "2026-01-01"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"OkresFa": "2026-01"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"P_6": "2026-01-01", "OkresFa": "2026-01"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_oneof_object_required_and_not_branches_are_disjoint():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Zaplacono": {"const": 1},
+            "DataZaplaty": {"type": "string"},
+            "ZnacznikZaplatyCzesciowej": {"enum": [1, 2]},
+            "ZaplataCzesciowa": {"type": "string"},
+        },
+        "oneOf": [
+            {
+                "required": ["Zaplacono", "DataZaplaty"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["ZnacznikZaplatyCzesciowej"]},
+                        {"required": ["ZaplataCzesciowa"]},
+                    ]
+                },
+            },
+            {
+                "required": ["ZnacznikZaplatyCzesciowej", "ZaplataCzesciowa"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["Zaplacono"]},
+                        {"required": ["DataZaplaty"]},
+                    ]
+                },
+            },
+            {
+                "not": {
+                    "anyOf": [
+                        {"required": ["Zaplacono"]},
+                        {"required": ["DataZaplaty"]},
+                        {"required": ["ZnacznikZaplatyCzesciowej"]},
+                        {"required": ["ZaplataCzesciowa"]},
+                    ]
+                }
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"Zaplacono": 1, "DataZaplaty": "2026-01-01"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "ZnacznikZaplatyCzesciowej": 1,
+            "ZaplataCzesciowa": "czesc",
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Zaplacono": 1,
+            "DataZaplaty": "2026-01-01",
+            "ZnacznikZaplatyCzesciowej": 1,
+            "ZaplataCzesciowa": "czesc",
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_oneof_overlapping_branches_raise():
+    schema = {"oneOf": [{"enum": [1, 2]}, {"enum": [2, 3]}]}
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "oneOf branches are not mutually exclusive" in str(e.value)
+
+    schema = {"oneOf": [{"type": "integer"}, {"type": "number"}]}
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "oneOf branches are not mutually exclusive" in str(e.value)
+
+
+def test_allof_can_narrow_overlapping_oneof():
+    schema = {
+        "allOf": [
+            {"oneOf": [{"enum": [1, 2]}, {"enum": [2, 3]}]},
+            {"const": 1},
+        ]
+    }
+
+    check_schema_with_instance(schema, 1, any_whitespace=False)
+    check_schema_with_instance(schema, 2, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 3, is_accepted=False, any_whitespace=False)
+
+
+def test_allof_of_independent_oneof_groups():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Zaplacono": {"type": "integer"},
+            "DataZaplaty": {"type": "string"},
+            "ZnacznikZaplatyCzesciowej": {"type": "integer"},
+            "ZaplataCzesciowa": {"type": "string"},
+            "FormaPlatnosci": {"type": "integer"},
+            "PlatnoscInna": {"type": "integer"},
+            "OpisPlatnosci": {"type": "string"},
+        },
+        "allOf": [
+            {
+                "oneOf": [
+                    {"required": ["Zaplacono", "DataZaplaty"]},
+                    {
+                        "required": [
+                            "ZnacznikZaplatyCzesciowej",
+                            "ZaplataCzesciowa",
+                        ]
+                    },
+                    {
+                        "not": {
+                            "anyOf": [
+                                {"required": ["Zaplacono"]},
+                                {"required": ["DataZaplaty"]},
+                                {"required": ["ZnacznikZaplatyCzesciowej"]},
+                                {"required": ["ZaplataCzesciowa"]},
+                            ]
+                        }
+                    },
+                ]
+            },
+            {
+                "oneOf": [
+                    {"required": ["FormaPlatnosci"]},
+                    {"required": ["PlatnoscInna", "OpisPlatnosci"]},
+                    {
+                        "not": {
+                            "anyOf": [
+                                {"required": ["FormaPlatnosci"]},
+                                {"required": ["PlatnoscInna"]},
+                                {"required": ["OpisPlatnosci"]},
+                            ]
+                        }
+                    },
+                ]
+            },
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Zaplacono": 1, "DataZaplaty": "2026-01-01", "FormaPlatnosci": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "ZnacznikZaplatyCzesciowej": 1,
+            "ZaplataCzesciowa": "czesc",
+            "PlatnoscInna": 1,
+            "OpisPlatnosci": "opis",
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"Zaplacono": 1, "DataZaplaty": "2026-01-01", "PlatnoscInna": 1},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Zaplacono": 1,
+            "DataZaplaty": "2026-01-01",
+            "FormaPlatnosci": 1,
+            "PlatnoscInna": 1,
+            "OpisPlatnosci": "opis",
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_allof_numeric_constraints():
+    schema = {
+        "allOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "integer", "maximum": 2},
+        ]
+    }
+
+    check_schema_with_instance(schema, 0, any_whitespace=False)
+    check_schema_with_instance(schema, 2, any_whitespace=False)
+    check_schema_with_instance(schema, -1, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 3, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, 1.5, is_accepted=False, any_whitespace=False)
+
+
+def test_allof_of_independent_oneof_groups_with_branch_properties():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "KOR"]},
+            "FaWiersz": {"type": "string"},
+            "DaneFaKorygowanej": {"type": "string"},
+            "TypPlatnosci": {"enum": ["STD", "OTHER"]},
+            "FormaPlatnosci": {"type": "integer"},
+            "PlatnoscInna": {"type": "integer"},
+            "OpisPlatnosci": {"type": "string"},
+        },
+        "allOf": [
+            {
+                "oneOf": [
+                    {
+                        "properties": {"RodzajFaktury": {"const": "VAT"}},
+                        "required": ["RodzajFaktury", "FaWiersz"],
+                    },
+                    {
+                        "properties": {"RodzajFaktury": {"const": "KOR"}},
+                        "required": ["RodzajFaktury", "DaneFaKorygowanej"],
+                    },
+                ]
+            },
+            {
+                "oneOf": [
+                    {
+                        "properties": {"TypPlatnosci": {"const": "STD"}},
+                        "required": ["TypPlatnosci", "FormaPlatnosci"],
+                    },
+                    {
+                        "properties": {"TypPlatnosci": {"const": "OTHER"}},
+                        "required": ["TypPlatnosci", "PlatnoscInna", "OpisPlatnosci"],
+                    },
+                ]
+            },
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {
+            "RodzajFaktury": "VAT",
+            "FaWiersz": "wiersz",
+            "TypPlatnosci": "STD",
+            "FormaPlatnosci": 1,
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "RodzajFaktury": "KOR",
+            "DaneFaKorygowanej": "korekta",
+            "TypPlatnosci": "OTHER",
+            "PlatnoscInna": 1,
+            "OpisPlatnosci": "opis",
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "RodzajFaktury": "VAT",
+            "TypPlatnosci": "STD",
+            "FormaPlatnosci": 1,
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "RodzajFaktury": "VAT",
+            "DaneFaKorygowanej": "korekta",
+            "TypPlatnosci": "STD",
+            "FormaPlatnosci": 1,
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "RodzajFaktury": "KOR",
+            "DaneFaKorygowanej": "korekta",
+            "TypPlatnosci": "OTHER",
+            "PlatnoscInna": 1,
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_allof_with_anyof_branch():
+    schema = {
+        "allOf": [
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"type": "integer", "minimum": 0},
+        ]
+    }
+
+    check_schema_with_instance(schema, 1, any_whitespace=False)
+    check_schema_with_instance(schema, json.dumps("hello"), is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, -1, is_accepted=False, any_whitespace=False)
+
+
+def test_dependent_required_bidirectional_pair():
+    schema = {
+        "type": "object",
+        "properties": {
+            "P_13_1": {"type": "number"},
+            "P_14_1": {"type": "number"},
+        },
+        "dependentRequired": {
+            "P_13_1": ["P_14_1"],
+            "P_14_1": ["P_13_1"],
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"P_13_1": 100, "P_14_1": 23},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"P_13_1": 100},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"P_14_1": 23},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_dependent_required_multiple_targets():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+            "C": {"type": "integer"},
+        },
+        "dependentRequired": {
+            "A": ["B", "C"],
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"B": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"C": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1, "B": 2, "C": 3}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"A": 1, "B": 2}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"A": 1, "C": 3}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_required_mutual_exclusion():
+    schema = {
+        "type": "object",
+        "properties": {
+            "P_6": {"type": "string"},
+            "OkresFa": {"type": "string"},
+            "Other": {"type": "string"},
+        },
+        "not": {"required": ["P_6", "OkresFa"]},
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"P_6": "x"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"OkresFa": "x"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"P_6": "x", "Other": "y"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"P_6": "x", "OkresFa": "y"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_not_anyof_required_forbids_all():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+            "C": {"type": "integer"},
+        },
+        "not": {
+            "anyOf": [
+                {"required": ["A", "B"]},
+                {"required": ["A", "C"]},
+            ]
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"B": 1, "C": 2}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"A": 1, "B": 2}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"A": 1, "C": 2}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"A": 1, "B": 2, "C": 3}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_empty_required_is_unsatisfiable():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+        },
+        "not": {"required": []},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "object presence constraints have no satisfiable assignments" in str(e.value)
+
+
+
+
+def test_not_unsupported_object_pattern_raises():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+        },
+        "not": {
+            "properties": {
+                "A": {"const": 1},
+            }
+        },
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "object not only supports required or anyOf of required groups" in str(e.value)
+
+
+def test_object_presence_constraints_preserve_unrelated_required_fields():
+    schema = {
+        "type": "object",
+        "properties": {
+            "KwotaZaplatyCzesciowej": {"type": "number"},
+            "DataZaplatyCzesciowej": {"type": "string"},
+            "FormaPlatnosci": {"type": "integer"},
+            "PlatnoscInna": {"const": 1},
+            "OpisPlatnosci": {"type": "string"},
+        },
+        "required": ["KwotaZaplatyCzesciowej", "DataZaplatyCzesciowej"],
+        "not": {"required": ["FormaPlatnosci", "PlatnoscInna"]},
+        "dependentRequired": {
+            "PlatnoscInna": ["OpisPlatnosci"],
+            "OpisPlatnosci": ["PlatnoscInna"],
+        },
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"KwotaZaplatyCzesciowej": 1, "DataZaplatyCzesciowej": "2026-01-01"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "KwotaZaplatyCzesciowej": 1,
+            "DataZaplatyCzesciowej": "2026-01-01",
+            "FormaPlatnosci": 1,
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "KwotaZaplatyCzesciowej": 1,
+            "DataZaplatyCzesciowej": "2026-01-01",
+            "PlatnoscInna": 1,
+            "OpisPlatnosci": "opis",
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "KwotaZaplatyCzesciowej": 1,
+            "DataZaplatyCzesciowej": "2026-01-01",
+            "PlatnoscInna": 1,
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "KwotaZaplatyCzesciowej": 1,
+            "DataZaplatyCzesciowej": "2026-01-01",
+            "FormaPlatnosci": 1,
+            "PlatnoscInna": 1,
+            "OpisPlatnosci": "opis",
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_allof_object_constraints():
+    schema = {
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+            {
+                "type": "object",
+                "properties": {"name": {"type": "string", "minLength": 3}},
+                "additionalProperties": False,
+            },
+        ]
+    }
+
+    check_schema_with_instance(schema, {"name": "John"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"name": "Al"}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"name": "John", "extra": 1}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {}, is_accepted=False, any_whitespace=False)
+
+
+def test_allof_optional_property_conflict_forbids_property():
+    schema = {
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "additionalProperties": False,
+            },
+        ]
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"value": "hello"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"value": 1}, is_accepted=False, any_whitespace=False)
+
+
+def test_allof_array_constraints():
+    schema = {
+        "allOf": [
+            {
+                "type": "array",
+                "prefixItems": [{"type": "string"}],
+                "items": False,
+            },
+            {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 1,
+            },
+        ]
+    }
+
+    check_schema_with_instance(schema, ["hello"], any_whitespace=False)
+    check_schema_with_instance(schema, [], is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, ["hello", "world"], is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, [1], is_accepted=False, any_whitespace=False)
+
+
+def test_allof_unsatisfiable_schema_raises():
+    schema = {"allOf": [{"const": 1}, {"const": 2}]}
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "allOf const constraints conflict" in str(e.value)
+
+    schema = {
+        "allOf": [
+            {
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {"b": {"type": "integer"}},
+                "required": ["b"],
+                "additionalProperties": False,
+            },
+        ]
+    }
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert 'required object property "a" is forbidden by another schema' in str(e.value)
+
+
 def test_alias():
     class MainModel(BaseModel):
         test: str = Field(..., alias="name")

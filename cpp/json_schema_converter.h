@@ -94,6 +94,8 @@ struct ObjectSpec {
   std::vector<Property> properties;
   std::vector<PatternProperty> pattern_properties;
   std::unordered_set<std::string> required;
+  std::unordered_map<std::string, std::vector<std::string>> dependent_required;
+  std::vector<std::vector<std::string>> forbidden_groups;
 
   bool allow_additional_properties = false;
   SchemaSpecPtr additional_properties_schema;
@@ -132,6 +134,12 @@ struct AnyOfSpec {
   std::string ToString() const;
 };
 
+struct OneOfSpec {
+  std::vector<SchemaSpecPtr> options;
+
+  std::string ToString() const;
+};
+
 struct AllOfSpec {
   std::vector<SchemaSpecPtr> schemas;
 
@@ -159,6 +167,7 @@ using SchemaSpecVariant = std::variant<
     EnumSpec,
     RefSpec,
     AnyOfSpec,
+    OneOfSpec,
     AllOfSpec,
     TypeArraySpec>;
 
@@ -291,6 +300,7 @@ class JSONSchemaConverter {
   virtual std::string GenerateEnum(const EnumSpec& spec, const std::string& rule_name);
   virtual std::string GenerateRef(const RefSpec& spec, const std::string& rule_name);
   virtual std::string GenerateAnyOf(const AnyOfSpec& spec, const std::string& rule_name);
+  virtual std::string GenerateOneOf(const OneOfSpec& spec, const std::string& rule_name);
   virtual std::string GenerateAllOf(const AllOfSpec& spec, const std::string& rule_name);
   virtual std::string GenerateTypeArray(const TypeArraySpec& spec, const std::string& rule_name);
 
@@ -337,6 +347,9 @@ class JSONSchemaConverter {
 
   /*! \brief Create a rule and return the rule name (handles caching). */
   std::string CreateRule(const SchemaSpecPtr& spec, const std::string& rule_name_hint);
+
+  /*! \brief Create or reuse a generated rule with identical body. */
+  std::string CreateGeneratedRule(const std::string& rule_name_hint, const std::string& rule_body);
 
   /*! \brief Get next separator from indent manager. */
   virtual std::string NextSeparator(bool is_end = false);
@@ -405,6 +418,7 @@ class JSONSchemaConverter {
     size_t operator()(const StringSpecKey& key) const;
   };
   std::unordered_map<StringSpecKey, std::string, StringSpecKeyHash> string_spec_cache_;
+  std::unordered_map<std::string, std::string> generated_rule_body_cache_;
 
   // Helper for integer/number range regex generation
   static std::string GenerateRangeRegex(std::optional<int64_t> start, std::optional<int64_t> end);

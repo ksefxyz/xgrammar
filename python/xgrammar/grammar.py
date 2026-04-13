@@ -232,6 +232,7 @@ class Grammar(XGRObject):
         print_converted_ebnf : bool, default: False
             If True, the converted EBNF string will be printed. For debugging purposes.
 
+
         Returns
         -------
         grammar : Grammar

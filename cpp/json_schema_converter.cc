@@ -83,8 +83,10 @@ std::string ObjectSpec::ToString() const {
     s += r;
     first = false;
   }
+  s += "], dependent_required.size()=" + std::to_string(dependent_required.size()) +
+       ", forbidden_groups.size()=" + std::to_string(forbidden_groups.size());
   s +=
-      std::string("], allow_additional_properties=") +
+      std::string(", allow_additional_properties=") +
       (allow_additional_properties ? "true" : "false") +
       ", additional_properties_schema=" + (additional_properties_schema ? "SchemaSpec" : "null") +
       ", allow_unevaluated_properties=" + (allow_unevaluated_properties ? "true" : "false") +
@@ -112,6 +114,10 @@ std::string RefSpec::ToString() const { return "RefSpec{uri=\"" + uri + "\"}"; }
 
 std::string AnyOfSpec::ToString() const {
   return "AnyOfSpec{options.size()=" + std::to_string(options.size()) + "}";
+}
+
+std::string OneOfSpec::ToString() const {
+  return "OneOfSpec{options.size()=" + std::to_string(options.size()) + "}";
 }
 
 std::string AllOfSpec::ToString() const {
@@ -165,6 +171,7 @@ class SchemaParser {
   Result<SchemaSpecPtr, SchemaError> ResolveRef(
       const std::string& uri, const std::string& rule_name_hint
   );
+  Result<SchemaSpecPtr, SchemaError> NormalizeExclusiveDisjunctions(const SchemaSpecPtr& spec);
 
  private:
   Result<IntegerSpec, SchemaError> ParseInteger(const picojson::object& schema);
@@ -177,10 +184,45 @@ class SchemaParser {
   Result<ConstSpec, SchemaError> ParseConst(const picojson::object& schema);
   Result<EnumSpec, SchemaError> ParseEnum(const picojson::object& schema);
   Result<RefSpec, SchemaError> ParseRef(const picojson::object& schema);
+  Result<std::vector<SchemaSpecPtr>, SchemaError> ParseCompositeOptions(
+      const picojson::object& schema,
+      const std::string& keyword,
+      const std::string& rule_name_prefix
+  );
   Result<AnyOfSpec, SchemaError> ParseAnyOf(const picojson::object& schema);
+  Result<SchemaSpecPtr, SchemaError> ParseOneOf(
+      const picojson::object& schema, const std::string& rule_name_hint
+  );
+  Result<std::optional<SchemaSpecPtr>, SchemaError> TryParseExclusiveObjectOneOf(
+      const picojson::object& schema, const std::string& rule_name_hint
+  );
   Result<AllOfSpec, SchemaError> ParseAllOf(const picojson::object& schema);
   Result<TypeArraySpec, SchemaError> ParseTypeArray(
       const picojson::object& schema, const std::string& rule_name_hint
+  );
+  Result<SchemaSpecPtr, SchemaError> MergeAllOfSchemas(
+      const std::vector<SchemaSpecPtr>& schemas, const std::string& rule_name_hint
+  );
+  Result<SchemaSpecPtr, SchemaError> MergeSchemaSpecs(
+      const SchemaSpecPtr& lhs, const SchemaSpecPtr& rhs, const std::string& rule_name_hint
+  );
+  Result<ObjectSpec, SchemaError> MergeObjectSpecs(
+      const ObjectSpec& lhs, const ObjectSpec& rhs, const std::string& rule_name_hint
+  );
+  Result<ArraySpec, SchemaError> MergeArraySpecs(
+      const ArraySpec& lhs, const ArraySpec& rhs, const std::string& rule_name_hint
+  );
+  Result<bool, SchemaError> AreSchemasDisjoint(
+      const SchemaSpecPtr& lhs, const SchemaSpecPtr& rhs, const std::string& rule_name_hint
+  );
+  Result<SchemaSpecPtr, SchemaError> NormalizeObjectPresenceConstraints(
+      const ObjectSpec& object, const std::string& rule_name_hint
+  );
+  Result<SchemaSpecPtr, SchemaError> NormalizeExclusiveDisjunctionsImpl(
+      const SchemaSpecPtr& spec,
+      const std::string& rule_name_hint,
+      std::unordered_set<const SchemaSpec*>* active_specs,
+      std::unordered_set<const SchemaSpec*>* normalized_specs
   );
 
   std::string ComputeCacheKey(const picojson::value& schema);
@@ -256,6 +298,803 @@ void SchemaParser::WarnUnsupportedKeywords(
   }
 }
 
+Result<SchemaSpecPtr, SchemaError> SchemaParser::MergeAllOfSchemas(
+    const std::vector<SchemaSpecPtr>& schemas, const std::string& rule_name_hint
+) {
+  if (schemas.empty()) {
+    return ResultOk(SchemaSpec::Make(AnySpec{}, "", rule_name_hint));
+  }
+  auto merged = schemas[0];
+  for (size_t i = 1; i < schemas.size(); ++i) {
+    auto merge_result =
+        MergeSchemaSpecs(merged, schemas[i], rule_name_hint + "_merge_" + std::to_string(i));
+    if (merge_result.IsErr()) return ResultErr(std::move(merge_result).UnwrapErr());
+    merged = std::move(merge_result).Unwrap();
+  }
+  return ResultOk(merged);
+}
+
+Result<ObjectSpec, SchemaError> SchemaParser::MergeObjectSpecs(
+    const ObjectSpec& lhs, const ObjectSpec& rhs, const std::string& rule_name_hint
+) {
+  if (!lhs.pattern_properties.empty() || !rhs.pattern_properties.empty() || lhs.property_names ||
+      rhs.property_names) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema,
+        "allOf merging objects with patternProperties or propertyNames is not supported"
+    );
+  }
+
+  auto make_any_schema = []() { return SchemaSpec::Make(AnySpec{}, "", "any"); };
+  auto get_fallback_schema = [&](const ObjectSpec& spec) -> std::optional<SchemaSpecPtr> {
+    if (spec.allow_additional_properties) {
+      return spec.additional_properties_schema ? spec.additional_properties_schema : make_any_schema();
+    }
+    if (spec.allow_unevaluated_properties) {
+      return spec.unevaluated_properties_schema ? spec.unevaluated_properties_schema : make_any_schema();
+    }
+    return std::nullopt;
+  };
+  auto get_property_schema =
+      [&](const ObjectSpec& spec, const std::string& name) -> std::optional<SchemaSpecPtr> {
+    for (const auto& property : spec.properties) {
+      if (property.name == name) {
+        return property.schema;
+      }
+    }
+    return get_fallback_schema(spec);
+  };
+  auto append_unique_name = [](std::vector<std::string>* names, const std::string& name) {
+    if (std::find(names->begin(), names->end(), name) == names->end()) {
+      names->push_back(name);
+    }
+  };
+
+  ObjectSpec merged;
+  std::vector<std::string> property_names;
+  property_names.reserve(lhs.properties.size() + rhs.properties.size());
+  for (const auto& property : lhs.properties) {
+    append_unique_name(&property_names, property.name);
+  }
+  for (const auto& property : rhs.properties) {
+    append_unique_name(&property_names, property.name);
+  }
+
+  for (const auto& name : property_names) {
+    bool is_required = lhs.required.count(name) || rhs.required.count(name);
+    auto lhs_schema = get_property_schema(lhs, name);
+    auto rhs_schema = get_property_schema(rhs, name);
+    if (!lhs_schema || !rhs_schema) {
+      if (is_required) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kUnsatisfiableSchema,
+            "allOf required object property \"" + name + "\" is forbidden by another schema"
+        );
+      }
+      continue;
+    }
+
+    auto merge_result = MergeSchemaSpecs(*lhs_schema, *rhs_schema, rule_name_hint + "_" + name);
+    if (merge_result.IsErr()) {
+      auto err = std::move(merge_result).UnwrapErr();
+      if (err.Type() == SchemaErrorType::kUnsatisfiableSchema && !is_required) {
+        continue;
+      }
+      return ResultErr<SchemaError>(std::move(err));
+    }
+
+    merged.properties.push_back({name, std::move(merge_result).Unwrap()});
+    if (is_required) {
+      merged.required.insert(name);
+    }
+  }
+
+  for (const auto& [trigger, deps] : lhs.dependent_required) {
+    auto& merged_deps = merged.dependent_required[trigger];
+    for (const auto& dep : deps) {
+      append_unique_name(&merged_deps, dep);
+    }
+  }
+  for (const auto& [trigger, deps] : rhs.dependent_required) {
+    auto& merged_deps = merged.dependent_required[trigger];
+    for (const auto& dep : deps) {
+      append_unique_name(&merged_deps, dep);
+    }
+  }
+
+  for (const auto& group : lhs.forbidden_groups) {
+    merged.forbidden_groups.push_back(group);
+  }
+  for (const auto& group : rhs.forbidden_groups) {
+    merged.forbidden_groups.push_back(group);
+  }
+
+  auto lhs_fallback = get_fallback_schema(lhs);
+  auto rhs_fallback = get_fallback_schema(rhs);
+  std::optional<SchemaSpecPtr> merged_fallback;
+  if (lhs_fallback && rhs_fallback) {
+    auto merge_result =
+        MergeSchemaSpecs(*lhs_fallback, *rhs_fallback, rule_name_hint + "_additional");
+    if (merge_result.IsErr()) {
+      auto err = std::move(merge_result).UnwrapErr();
+      if (err.Type() != SchemaErrorType::kUnsatisfiableSchema) {
+        return ResultErr<SchemaError>(std::move(err));
+      }
+    } else {
+      merged_fallback = std::move(merge_result).Unwrap();
+    }
+  }
+
+  merged.min_properties = std::max(lhs.min_properties, rhs.min_properties);
+  if (lhs.max_properties == -1) {
+    merged.max_properties = rhs.max_properties;
+  } else if (rhs.max_properties == -1) {
+    merged.max_properties = lhs.max_properties;
+  } else {
+    merged.max_properties = std::min(lhs.max_properties, rhs.max_properties);
+  }
+  if (merged.max_properties != -1 && merged.min_properties > merged.max_properties) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "allOf object property count constraints conflict"
+    );
+  }
+  if (merged.max_properties != -1 &&
+      static_cast<int>(merged.required.size()) > merged.max_properties) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        "maxProperties is less than the number of required properties after allOf merge"
+    );
+  }
+  if (!merged_fallback && merged.min_properties > static_cast<int>(merged.properties.size())) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        "minProperties is greater than the number of satisfiable properties after allOf merge"
+    );
+  }
+
+  merged.allow_additional_properties = merged_fallback.has_value();
+  merged.additional_properties_schema = nullptr;
+  merged.allow_unevaluated_properties = merged_fallback.has_value();
+  merged.unevaluated_properties_schema = nullptr;
+  if (merged_fallback && !std::holds_alternative<AnySpec>((*merged_fallback)->spec)) {
+    merged.additional_properties_schema = *merged_fallback;
+  }
+
+  return ResultOk(std::move(merged));
+}
+
+Result<ArraySpec, SchemaError> SchemaParser::MergeArraySpecs(
+    const ArraySpec& lhs, const ArraySpec& rhs, const std::string& rule_name_hint
+) {
+  auto make_any_schema = []() { return SchemaSpec::Make(AnySpec{}, "", "any"); };
+  auto get_item_schema = [&](const ArraySpec& spec, size_t index) -> std::optional<SchemaSpecPtr> {
+    if (index < spec.prefix_items.size()) {
+      return spec.prefix_items[index];
+    }
+    if (spec.allow_additional_items) {
+      return spec.additional_items ? spec.additional_items : make_any_schema();
+    }
+    return std::nullopt;
+  };
+  auto get_effective_min_items = [](const ArraySpec& spec) {
+    return std::max(spec.min_items, static_cast<int64_t>(spec.prefix_items.size()));
+  };
+  auto get_effective_max_items = [](const ArraySpec& spec) {
+    return spec.allow_additional_items ? spec.max_items : static_cast<int64_t>(spec.prefix_items.size());
+  };
+
+  ArraySpec merged;
+  size_t merged_prefix_size = std::max(lhs.prefix_items.size(), rhs.prefix_items.size());
+  for (size_t i = 0; i < merged_prefix_size; ++i) {
+    auto lhs_item = get_item_schema(lhs, i);
+    auto rhs_item = get_item_schema(rhs, i);
+    if (!lhs_item || !rhs_item) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf array prefixItems conflict"
+      );
+    }
+
+    auto merge_result =
+        MergeSchemaSpecs(*lhs_item, *rhs_item, rule_name_hint + "_item_" + std::to_string(i));
+    if (merge_result.IsErr()) return ResultErr(std::move(merge_result).UnwrapErr());
+    merged.prefix_items.push_back(std::move(merge_result).Unwrap());
+  }
+
+  int64_t lhs_effective_min_items = get_effective_min_items(lhs);
+  int64_t rhs_effective_min_items = get_effective_min_items(rhs);
+  int64_t merged_effective_min_items = std::max(lhs_effective_min_items, rhs_effective_min_items);
+
+  int64_t lhs_effective_max_items = get_effective_max_items(lhs);
+  int64_t rhs_effective_max_items = get_effective_max_items(rhs);
+  if (lhs_effective_max_items == -1) {
+    merged.max_items = rhs_effective_max_items;
+  } else if (rhs_effective_max_items == -1) {
+    merged.max_items = lhs_effective_max_items;
+  } else {
+    merged.max_items = std::min(lhs_effective_max_items, rhs_effective_max_items);
+  }
+
+  merged.allow_additional_items = lhs.allow_additional_items && rhs.allow_additional_items;
+  merged.additional_items = nullptr;
+  if (merged.allow_additional_items) {
+    auto lhs_additional = get_item_schema(lhs, merged_prefix_size);
+    auto rhs_additional = get_item_schema(rhs, merged_prefix_size);
+    XGRAMMAR_DCHECK(lhs_additional.has_value() && rhs_additional.has_value());
+
+    auto merge_result =
+        MergeSchemaSpecs(*lhs_additional, *rhs_additional, rule_name_hint + "_additional");
+    if (merge_result.IsErr()) {
+      auto err = std::move(merge_result).UnwrapErr();
+      if (err.Type() != SchemaErrorType::kUnsatisfiableSchema) {
+        return ResultErr<SchemaError>(std::move(err));
+      }
+      merged.allow_additional_items = false;
+    } else {
+      merged.additional_items = std::move(merge_result).Unwrap();
+    }
+  }
+
+  if (!merged.allow_additional_items) {
+    int64_t exact_item_count = static_cast<int64_t>(merged.prefix_items.size());
+    if (merged_effective_min_items > exact_item_count ||
+        (merged.max_items != -1 && exact_item_count > merged.max_items)) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf array item count constraints conflict"
+      );
+    }
+    merged.min_items = exact_item_count;
+    merged.max_items = exact_item_count;
+    return ResultOk(std::move(merged));
+  }
+
+  merged.min_items = std::max(
+      merged_effective_min_items, static_cast<int64_t>(merged.prefix_items.size())
+  );
+  if (merged.max_items != -1 && merged.min_items > merged.max_items) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "allOf array item count constraints conflict"
+    );
+  }
+
+  return ResultOk(std::move(merged));
+}
+
+Result<SchemaSpecPtr, SchemaError> SchemaParser::MergeSchemaSpecs(
+    const SchemaSpecPtr& lhs, const SchemaSpecPtr& rhs, const std::string& rule_name_hint
+) {
+  if (std::holds_alternative<AnySpec>(lhs->spec)) return ResultOk(rhs);
+  if (std::holds_alternative<AnySpec>(rhs->spec)) return ResultOk(lhs);
+
+  auto resolve_if_needed = [&](const SchemaSpecPtr& spec) -> Result<SchemaSpecPtr, SchemaError> {
+    if (std::holds_alternative<RefSpec>(spec->spec)) {
+      return ResolveRef(std::get<RefSpec>(spec->spec).uri, rule_name_hint + "_ref");
+    }
+    if (std::holds_alternative<AllOfSpec>(spec->spec)) {
+      return MergeAllOfSchemas(std::get<AllOfSpec>(spec->spec).schemas, rule_name_hint + "_allof");
+    }
+    return ResultOk(spec);
+  };
+
+  auto lhs_resolved = resolve_if_needed(lhs);
+  if (lhs_resolved.IsErr()) return ResultErr(std::move(lhs_resolved).UnwrapErr());
+  auto rhs_resolved = resolve_if_needed(rhs);
+  if (rhs_resolved.IsErr()) return ResultErr(std::move(rhs_resolved).UnwrapErr());
+
+  auto lhs_spec = std::move(lhs_resolved).Unwrap();
+  auto rhs_spec = std::move(rhs_resolved).Unwrap();
+
+  auto merge_disjunction = [&](const std::vector<SchemaSpecPtr>& options,
+                               const SchemaSpecPtr& other) -> Result<SchemaSpecPtr, SchemaError> {
+    AnyOfSpec merged_anyof;
+    for (size_t i = 0; i < options.size(); ++i) {
+      auto merge_result =
+          MergeSchemaSpecs(options[i], other, rule_name_hint + "_option_" + std::to_string(i));
+      if (merge_result.IsOk()) {
+        merged_anyof.options.push_back(std::move(merge_result).Unwrap());
+      }
+    }
+    if (merged_anyof.options.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf options have no satisfiable intersection"
+      );
+    }
+    if (merged_anyof.options.size() == 1) {
+      return ResultOk(merged_anyof.options[0]);
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged_anyof), "", rule_name_hint));
+  };
+
+  auto merge_exclusive_disjunction =
+      [&](const std::vector<SchemaSpecPtr>& options,
+          const SchemaSpecPtr& other) -> Result<SchemaSpecPtr, SchemaError> {
+    OneOfSpec merged_oneof;
+    for (size_t i = 0; i < options.size(); ++i) {
+      auto merge_result =
+          MergeSchemaSpecs(options[i], other, rule_name_hint + "_option_" + std::to_string(i));
+      if (merge_result.IsOk()) {
+        merged_oneof.options.push_back(std::move(merge_result).Unwrap());
+      } else {
+        auto err = std::move(merge_result).UnwrapErr();
+        if (err.Type() != SchemaErrorType::kUnsatisfiableSchema) {
+          return ResultErr<SchemaError>(std::move(err));
+        }
+      }
+    }
+    if (merged_oneof.options.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "oneOf options have no satisfiable intersection"
+      );
+    }
+    if (merged_oneof.options.size() == 1) {
+      return ResultOk(merged_oneof.options[0]);
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged_oneof), "", rule_name_hint));
+  };
+
+  auto merge_two_exclusive_disjunctions =
+      [&](const std::vector<SchemaSpecPtr>& lhs_options,
+          const std::vector<SchemaSpecPtr>& rhs_options) -> Result<SchemaSpecPtr, SchemaError> {
+    OneOfSpec merged_oneof;
+    for (size_t i = 0; i < lhs_options.size(); ++i) {
+      for (size_t j = 0; j < rhs_options.size(); ++j) {
+        auto merge_result = MergeSchemaSpecs(
+            lhs_options[i],
+            rhs_options[j],
+            rule_name_hint + "_lhs_" + std::to_string(i) + "_rhs_" + std::to_string(j)
+        );
+        if (merge_result.IsOk()) {
+          merged_oneof.options.push_back(std::move(merge_result).Unwrap());
+        } else {
+          auto err = std::move(merge_result).UnwrapErr();
+          if (err.Type() != SchemaErrorType::kUnsatisfiableSchema) {
+            return ResultErr<SchemaError>(std::move(err));
+          }
+        }
+      }
+    }
+    if (merged_oneof.options.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf oneOf options have no satisfiable intersection"
+      );
+    }
+    if (merged_oneof.options.size() == 1) {
+      return ResultOk(merged_oneof.options[0]);
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged_oneof), "", rule_name_hint));
+  };
+
+  auto merge_integer_with_number =
+      [&](const IntegerSpec& integer_spec,
+          const NumberSpec& number_spec) -> Result<SchemaSpecPtr, SchemaError> {
+    int64_t lower = integer_spec.minimum.value_or(std::numeric_limits<int64_t>::min());
+    int64_t upper = integer_spec.maximum.value_or(std::numeric_limits<int64_t>::max());
+    if (integer_spec.exclusive_minimum.has_value()) {
+      lower = std::max(lower, integer_spec.exclusive_minimum.value() + 1);
+    }
+    if (integer_spec.exclusive_maximum.has_value()) {
+      upper = std::min(upper, integer_spec.exclusive_maximum.value() - 1);
+    }
+
+    constexpr double kMinInt64AsDouble =
+        static_cast<double>(std::numeric_limits<int64_t>::min());
+    constexpr double kMaxInt64AsDouble =
+        static_cast<double>(std::numeric_limits<int64_t>::max());
+
+    auto apply_number_lower_bound = [&](double bound, bool exclusive) {
+      double candidate = exclusive ? std::floor(bound) + 1.0 : std::ceil(bound);
+      if (candidate > kMaxInt64AsDouble) {
+        lower = 1;
+        upper = 0;
+        return;
+      }
+      if (candidate > kMinInt64AsDouble) {
+        lower = std::max(lower, static_cast<int64_t>(candidate));
+      }
+    };
+    auto apply_number_upper_bound = [&](double bound, bool exclusive) {
+      double candidate = exclusive ? std::ceil(bound) - 1.0 : std::floor(bound);
+      if (candidate < kMinInt64AsDouble) {
+        lower = 1;
+        upper = 0;
+        return;
+      }
+      if (candidate < kMaxInt64AsDouble) {
+        upper = std::min(upper, static_cast<int64_t>(candidate));
+      }
+    };
+
+    if (number_spec.minimum.has_value()) {
+      apply_number_lower_bound(number_spec.minimum.value(), false);
+    }
+    if (number_spec.exclusive_minimum.has_value()) {
+      apply_number_lower_bound(number_spec.exclusive_minimum.value(), true);
+    }
+    if (number_spec.maximum.has_value()) {
+      apply_number_upper_bound(number_spec.maximum.value(), false);
+    }
+    if (number_spec.exclusive_maximum.has_value()) {
+      apply_number_upper_bound(number_spec.exclusive_maximum.value(), true);
+    }
+
+    if (lower > upper) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf integer/number constraints conflict"
+      );
+    }
+
+    IntegerSpec merged;
+    if (lower != std::numeric_limits<int64_t>::min()) {
+      merged.minimum = lower;
+    }
+    if (upper != std::numeric_limits<int64_t>::max()) {
+      merged.maximum = upper;
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged), "", rule_name_hint));
+  };
+
+  if (std::holds_alternative<AnyOfSpec>(lhs_spec->spec)) {
+    return merge_disjunction(std::get<AnyOfSpec>(lhs_spec->spec).options, rhs_spec);
+  }
+  if (std::holds_alternative<AnyOfSpec>(rhs_spec->spec)) {
+    return merge_disjunction(std::get<AnyOfSpec>(rhs_spec->spec).options, lhs_spec);
+  }
+  if (std::holds_alternative<OneOfSpec>(lhs_spec->spec) &&
+      std::holds_alternative<OneOfSpec>(rhs_spec->spec)) {
+    return merge_two_exclusive_disjunctions(
+        std::get<OneOfSpec>(lhs_spec->spec).options, std::get<OneOfSpec>(rhs_spec->spec).options
+    );
+  }
+  if (std::holds_alternative<OneOfSpec>(lhs_spec->spec)) {
+    return merge_exclusive_disjunction(std::get<OneOfSpec>(lhs_spec->spec).options, rhs_spec);
+  }
+  if (std::holds_alternative<OneOfSpec>(rhs_spec->spec)) {
+    return merge_exclusive_disjunction(std::get<OneOfSpec>(rhs_spec->spec).options, lhs_spec);
+  }
+  if (std::holds_alternative<TypeArraySpec>(lhs_spec->spec)) {
+    return merge_disjunction(std::get<TypeArraySpec>(lhs_spec->spec).type_schemas, rhs_spec);
+  }
+  if (std::holds_alternative<TypeArraySpec>(rhs_spec->spec)) {
+    return merge_disjunction(std::get<TypeArraySpec>(rhs_spec->spec).type_schemas, lhs_spec);
+  }
+
+  if (std::holds_alternative<IntegerSpec>(lhs_spec->spec) &&
+      std::holds_alternative<IntegerSpec>(rhs_spec->spec)) {
+    const auto& a = std::get<IntegerSpec>(lhs_spec->spec);
+    const auto& b = std::get<IntegerSpec>(rhs_spec->spec);
+    IntegerSpec merged;
+
+    auto apply_lower = [](std::optional<int64_t> min_value,
+                          std::optional<int64_t> exclusive_value,
+                          std::optional<int64_t>* out_minimum,
+                          std::optional<int64_t>* out_exclusive_minimum) {
+      if (min_value.has_value()) {
+        if (!out_minimum->has_value() && !out_exclusive_minimum->has_value()) {
+          *out_minimum = min_value;
+        } else if (out_exclusive_minimum->has_value()) {
+          if (min_value.value() > out_exclusive_minimum->value()) {
+            *out_minimum = min_value;
+            *out_exclusive_minimum = std::nullopt;
+          }
+        } else if (min_value.value() > out_minimum->value()) {
+          *out_minimum = min_value;
+        }
+      }
+      if (exclusive_value.has_value()) {
+        if (!out_minimum->has_value() && !out_exclusive_minimum->has_value()) {
+          *out_exclusive_minimum = exclusive_value;
+        } else if (out_exclusive_minimum->has_value()) {
+          if (exclusive_value.value() >= out_exclusive_minimum->value()) {
+            *out_exclusive_minimum = exclusive_value;
+            *out_minimum = std::nullopt;
+          }
+        } else if (exclusive_value.value() > out_minimum->value()) {
+          *out_exclusive_minimum = exclusive_value;
+          *out_minimum = std::nullopt;
+        } else if (exclusive_value.value() == out_minimum->value()) {
+          *out_exclusive_minimum = exclusive_value;
+          *out_minimum = std::nullopt;
+        }
+      }
+    };
+    auto apply_upper = [](std::optional<int64_t> max_value,
+                          std::optional<int64_t> exclusive_value,
+                          std::optional<int64_t>* out_maximum,
+                          std::optional<int64_t>* out_exclusive_maximum) {
+      if (max_value.has_value()) {
+        if (!out_maximum->has_value() && !out_exclusive_maximum->has_value()) {
+          *out_maximum = max_value;
+        } else if (out_exclusive_maximum->has_value()) {
+          if (max_value.value() < out_exclusive_maximum->value()) {
+            *out_maximum = max_value;
+            *out_exclusive_maximum = std::nullopt;
+          }
+        } else if (max_value.value() < out_maximum->value()) {
+          *out_maximum = max_value;
+        }
+      }
+      if (exclusive_value.has_value()) {
+        if (!out_maximum->has_value() && !out_exclusive_maximum->has_value()) {
+          *out_exclusive_maximum = exclusive_value;
+        } else if (out_exclusive_maximum->has_value()) {
+          if (exclusive_value.value() <= out_exclusive_maximum->value()) {
+            *out_exclusive_maximum = exclusive_value;
+            *out_maximum = std::nullopt;
+          }
+        } else if (exclusive_value.value() < out_maximum->value()) {
+          *out_exclusive_maximum = exclusive_value;
+          *out_maximum = std::nullopt;
+        } else if (exclusive_value.value() == out_maximum->value()) {
+          *out_exclusive_maximum = exclusive_value;
+          *out_maximum = std::nullopt;
+        }
+      }
+    };
+
+    apply_lower(a.minimum, a.exclusive_minimum, &merged.minimum, &merged.exclusive_minimum);
+    apply_lower(b.minimum, b.exclusive_minimum, &merged.minimum, &merged.exclusive_minimum);
+    apply_upper(a.maximum, a.exclusive_maximum, &merged.maximum, &merged.exclusive_maximum);
+    apply_upper(b.maximum, b.exclusive_maximum, &merged.maximum, &merged.exclusive_maximum);
+
+    int64_t effective_min =
+        merged.exclusive_minimum.value_or(merged.minimum.value_or(std::numeric_limits<int64_t>::min()));
+    int64_t effective_max =
+        merged.exclusive_maximum.value_or(merged.maximum.value_or(std::numeric_limits<int64_t>::max()));
+    if (effective_min > effective_max ||
+        (effective_min == effective_max &&
+         (merged.exclusive_minimum.has_value() || merged.exclusive_maximum.has_value()))) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf integer constraints conflict"
+      );
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<IntegerSpec>(lhs_spec->spec) &&
+      std::holds_alternative<NumberSpec>(rhs_spec->spec)) {
+    return merge_integer_with_number(
+        std::get<IntegerSpec>(lhs_spec->spec), std::get<NumberSpec>(rhs_spec->spec)
+    );
+  }
+  if (std::holds_alternative<NumberSpec>(lhs_spec->spec) &&
+      std::holds_alternative<IntegerSpec>(rhs_spec->spec)) {
+    return merge_integer_with_number(
+        std::get<IntegerSpec>(rhs_spec->spec), std::get<NumberSpec>(lhs_spec->spec)
+    );
+  }
+
+  if (std::holds_alternative<NumberSpec>(lhs_spec->spec) &&
+      std::holds_alternative<NumberSpec>(rhs_spec->spec)) {
+    const auto& a = std::get<NumberSpec>(lhs_spec->spec);
+    const auto& b = std::get<NumberSpec>(rhs_spec->spec);
+    NumberSpec merged;
+
+    auto apply_lower = [](std::optional<double> min_value,
+                          std::optional<double> exclusive_value,
+                          std::optional<double>* out_minimum,
+                          std::optional<double>* out_exclusive_minimum) {
+      if (min_value.has_value()) {
+        if (!out_minimum->has_value() && !out_exclusive_minimum->has_value()) {
+          *out_minimum = min_value;
+        } else if (out_exclusive_minimum->has_value()) {
+          if (min_value.value() > out_exclusive_minimum->value()) {
+            *out_minimum = min_value;
+            *out_exclusive_minimum = std::nullopt;
+          }
+        } else if (min_value.value() > out_minimum->value()) {
+          *out_minimum = min_value;
+        }
+      }
+      if (exclusive_value.has_value()) {
+        if (!out_minimum->has_value() && !out_exclusive_minimum->has_value()) {
+          *out_exclusive_minimum = exclusive_value;
+        } else if (out_exclusive_minimum->has_value()) {
+          if (exclusive_value.value() >= out_exclusive_minimum->value()) {
+            *out_exclusive_minimum = exclusive_value;
+            *out_minimum = std::nullopt;
+          }
+        } else if (exclusive_value.value() > out_minimum->value()) {
+          *out_exclusive_minimum = exclusive_value;
+          *out_minimum = std::nullopt;
+        } else if (exclusive_value.value() == out_minimum->value()) {
+          *out_exclusive_minimum = exclusive_value;
+          *out_minimum = std::nullopt;
+        }
+      }
+    };
+    auto apply_upper = [](std::optional<double> max_value,
+                          std::optional<double> exclusive_value,
+                          std::optional<double>* out_maximum,
+                          std::optional<double>* out_exclusive_maximum) {
+      if (max_value.has_value()) {
+        if (!out_maximum->has_value() && !out_exclusive_maximum->has_value()) {
+          *out_maximum = max_value;
+        } else if (out_exclusive_maximum->has_value()) {
+          if (max_value.value() < out_exclusive_maximum->value()) {
+            *out_maximum = max_value;
+            *out_exclusive_maximum = std::nullopt;
+          }
+        } else if (max_value.value() < out_maximum->value()) {
+          *out_maximum = max_value;
+        }
+      }
+      if (exclusive_value.has_value()) {
+        if (!out_maximum->has_value() && !out_exclusive_maximum->has_value()) {
+          *out_exclusive_maximum = exclusive_value;
+        } else if (out_exclusive_maximum->has_value()) {
+          if (exclusive_value.value() <= out_exclusive_maximum->value()) {
+            *out_exclusive_maximum = exclusive_value;
+            *out_maximum = std::nullopt;
+          }
+        } else if (exclusive_value.value() < out_maximum->value()) {
+          *out_exclusive_maximum = exclusive_value;
+          *out_maximum = std::nullopt;
+        } else if (exclusive_value.value() == out_maximum->value()) {
+          *out_exclusive_maximum = exclusive_value;
+          *out_maximum = std::nullopt;
+        }
+      }
+    };
+
+    apply_lower(a.minimum, a.exclusive_minimum, &merged.minimum, &merged.exclusive_minimum);
+    apply_lower(b.minimum, b.exclusive_minimum, &merged.minimum, &merged.exclusive_minimum);
+    apply_upper(a.maximum, a.exclusive_maximum, &merged.maximum, &merged.exclusive_maximum);
+    apply_upper(b.maximum, b.exclusive_maximum, &merged.maximum, &merged.exclusive_maximum);
+
+    double effective_min = merged.exclusive_minimum.value_or(
+        merged.minimum.value_or(-std::numeric_limits<double>::infinity())
+    );
+    double effective_max = merged.exclusive_maximum.value_or(
+        merged.maximum.value_or(std::numeric_limits<double>::infinity())
+    );
+    if (effective_min > effective_max ||
+        (effective_min == effective_max &&
+         (merged.exclusive_minimum.has_value() || merged.exclusive_maximum.has_value()))) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf number constraints conflict"
+      );
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<StringSpec>(lhs_spec->spec) &&
+      std::holds_alternative<StringSpec>(rhs_spec->spec)) {
+    const auto& a = std::get<StringSpec>(lhs_spec->spec);
+    const auto& b = std::get<StringSpec>(rhs_spec->spec);
+    StringSpec merged = a;
+    merged.min_length = std::max(a.min_length, b.min_length);
+    if (a.max_length == -1) {
+      merged.max_length = b.max_length;
+    } else if (b.max_length == -1) {
+      merged.max_length = a.max_length;
+    } else {
+      merged.max_length = std::min(a.max_length, b.max_length);
+    }
+    if (merged.max_length != -1 && merged.min_length > merged.max_length) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf string length constraints conflict"
+      );
+    }
+    if (a.pattern && b.pattern && a.pattern.value() != b.pattern.value()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "allOf merging different string patterns is not supported"
+      );
+    }
+    if (a.format && b.format && a.format.value() != b.format.value()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "allOf merging different string formats is not supported"
+      );
+    }
+    if (!merged.pattern) merged.pattern = b.pattern;
+    if (!merged.format) merged.format = b.format;
+    return ResultOk(SchemaSpec::Make(std::move(merged), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<BooleanSpec>(lhs_spec->spec) &&
+      std::holds_alternative<BooleanSpec>(rhs_spec->spec)) {
+    return ResultOk(lhs_spec);
+  }
+  if (std::holds_alternative<NullSpec>(lhs_spec->spec) &&
+      std::holds_alternative<NullSpec>(rhs_spec->spec)) {
+    return ResultOk(lhs_spec);
+  }
+
+  if (std::holds_alternative<ObjectSpec>(lhs_spec->spec) &&
+      std::holds_alternative<ObjectSpec>(rhs_spec->spec)) {
+    auto merge_result = MergeObjectSpecs(
+        std::get<ObjectSpec>(lhs_spec->spec), std::get<ObjectSpec>(rhs_spec->spec), rule_name_hint
+    );
+    if (merge_result.IsErr()) return ResultErr(std::move(merge_result).UnwrapErr());
+    return ResultOk(SchemaSpec::Make(std::move(merge_result).Unwrap(), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<ArraySpec>(lhs_spec->spec) &&
+      std::holds_alternative<ArraySpec>(rhs_spec->spec)) {
+    auto merge_result = MergeArraySpecs(
+        std::get<ArraySpec>(lhs_spec->spec), std::get<ArraySpec>(rhs_spec->spec), rule_name_hint
+    );
+    if (merge_result.IsErr()) return ResultErr(std::move(merge_result).UnwrapErr());
+    return ResultOk(SchemaSpec::Make(std::move(merge_result).Unwrap(), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<ConstSpec>(lhs_spec->spec) &&
+      std::holds_alternative<ConstSpec>(rhs_spec->spec)) {
+    if (std::get<ConstSpec>(lhs_spec->spec).json_value ==
+        std::get<ConstSpec>(rhs_spec->spec).json_value) {
+      return ResultOk(lhs_spec);
+    }
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "allOf const constraints conflict"
+    );
+  }
+
+  if (std::holds_alternative<EnumSpec>(lhs_spec->spec) &&
+      std::holds_alternative<EnumSpec>(rhs_spec->spec)) {
+    EnumSpec merged;
+    for (const auto& value : std::get<EnumSpec>(lhs_spec->spec).json_values) {
+      if (std::find(
+              std::get<EnumSpec>(rhs_spec->spec).json_values.begin(),
+              std::get<EnumSpec>(rhs_spec->spec).json_values.end(),
+              value
+          ) != std::get<EnumSpec>(rhs_spec->spec).json_values.end()) {
+        merged.json_values.push_back(value);
+      }
+    }
+    if (merged.json_values.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema, "allOf enum constraints conflict"
+      );
+    }
+    if (merged.json_values.size() == 1) {
+      return ResultOk(SchemaSpec::Make(ConstSpec{merged.json_values[0]}, "", rule_name_hint));
+    }
+    return ResultOk(SchemaSpec::Make(std::move(merged), "", rule_name_hint));
+  }
+
+  if (std::holds_alternative<ConstSpec>(lhs_spec->spec) &&
+      std::holds_alternative<EnumSpec>(rhs_spec->spec)) {
+    const auto& const_value = std::get<ConstSpec>(lhs_spec->spec).json_value;
+    const auto& enum_values = std::get<EnumSpec>(rhs_spec->spec).json_values;
+    if (std::find(enum_values.begin(), enum_values.end(), const_value) != enum_values.end()) {
+      return ResultOk(lhs_spec);
+    }
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "allOf const/enum constraints conflict"
+    );
+  }
+
+  if (std::holds_alternative<EnumSpec>(lhs_spec->spec) &&
+      std::holds_alternative<ConstSpec>(rhs_spec->spec)) {
+    return MergeSchemaSpecs(rhs_spec, lhs_spec, rule_name_hint);
+  }
+
+  auto get_atomic_type_id = [](const SchemaSpecPtr& spec) -> int {
+    if (std::holds_alternative<IntegerSpec>(spec->spec)) return 0;
+    if (std::holds_alternative<NumberSpec>(spec->spec)) return 1;
+    if (std::holds_alternative<StringSpec>(spec->spec)) return 2;
+    if (std::holds_alternative<BooleanSpec>(spec->spec)) return 3;
+    if (std::holds_alternative<NullSpec>(spec->spec)) return 4;
+    if (std::holds_alternative<ArraySpec>(spec->spec)) return 5;
+    if (std::holds_alternative<ObjectSpec>(spec->spec)) return 6;
+    return -1;
+  };
+  int lhs_atomic_type_id = get_atomic_type_id(lhs_spec);
+  int rhs_atomic_type_id = get_atomic_type_id(rhs_spec);
+  if (lhs_atomic_type_id != -1 && rhs_atomic_type_id != -1 &&
+      lhs_atomic_type_id != rhs_atomic_type_id) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema, "allOf types have empty intersection"
+    );
+  }
+
+  if (lhs_spec->spec.index() == rhs_spec->spec.index()) {
+    return ResultOk(lhs_spec);
+  }
+
+  return ResultErr<SchemaError>(
+      SchemaErrorType::kInvalidSchema, "allOf merge for the provided schema combination is not supported"
+  );
+}
+
 Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
     const picojson::value& schema,
     const std::string& rule_name_hint,
@@ -285,9 +1124,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
   }
 
   const auto& schema_obj = schema.get<picojson::object>();
-  WarnUnsupportedKeywords(
-      schema_obj, {"not", "if", "then", "else", "dependentRequired", "dependentSchemas"}
-  );
+  WarnUnsupportedKeywords(schema_obj, {"if", "then", "else", "dependentSchemas"});
 
   SchemaSpecPtr result;
 
@@ -304,10 +1141,16 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
     auto enum_result = ParseEnum(schema_obj);
     if (enum_result.IsErr()) return ResultErr(std::move(enum_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(enum_result).Unwrap(), cache_key, rule_name_hint);
-  } else if (schema_obj.count("anyOf") || schema_obj.count("oneOf")) {
+  } else if (schema_obj.count("anyOf")) {
     auto anyof_result = ParseAnyOf(schema_obj);
     if (anyof_result.IsErr()) return ResultErr(std::move(anyof_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(anyof_result).Unwrap(), cache_key, rule_name_hint);
+  } else if (schema_obj.count("oneOf")) {
+    auto oneof_result = ParseOneOf(schema_obj, rule_name_hint);
+    if (oneof_result.IsErr()) return ResultErr(std::move(oneof_result).UnwrapErr());
+    result = std::move(oneof_result).Unwrap();
+    result->cache_key = cache_key;
+    result->rule_name_hint = rule_name_hint;
   } else if (schema_obj.count("allOf")) {
     auto allof_result = ParseAllOf(schema_obj);
     if (allof_result.IsErr()) return ResultErr(std::move(allof_result).UnwrapErr());
@@ -376,7 +1219,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
 }
 
 Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::object& schema) {
-  WarnUnsupportedKeywords(schema, {"multipleOf"});
+  WarnUnsupportedKeywords(schema, {"multipleOf", "not"});
   IntegerSpec spec;
 
   auto checkAndConvertIntegerBound = [](const picojson::value& value
@@ -461,7 +1304,7 @@ Result<IntegerSpec, SchemaError> SchemaParser::ParseInteger(const picojson::obje
 }
 
 Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object& schema) {
-  WarnUnsupportedKeywords(schema, {"multipleOf"});
+  WarnUnsupportedKeywords(schema, {"multipleOf", "not"});
   NumberSpec spec;
 
   auto getDouble = [](const picojson::value& value) -> Result<double, SchemaError> {
@@ -509,6 +1352,7 @@ Result<NumberSpec, SchemaError> SchemaParser::ParseNumber(const picojson::object
 }
 
 Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object& schema) {
+  WarnUnsupportedKeywords(schema, {"not"});
   StringSpec spec;
   if (schema.count("format")) spec.format = schema.at("format").get<std::string>();
   if (schema.count("pattern")) spec.pattern = schema.at("pattern").get<std::string>();
@@ -538,16 +1382,18 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
   return ResultOk(std::move(spec));
 }
 
-Result<BooleanSpec, SchemaError> SchemaParser::ParseBoolean(const picojson::object&) {
+Result<BooleanSpec, SchemaError> SchemaParser::ParseBoolean(const picojson::object& schema) {
+  WarnUnsupportedKeywords(schema, {"not"});
   return ResultOk(BooleanSpec{});
 }
 
-Result<NullSpec, SchemaError> SchemaParser::ParseNull(const picojson::object&) {
+Result<NullSpec, SchemaError> SchemaParser::ParseNull(const picojson::object& schema) {
+  WarnUnsupportedKeywords(schema, {"not"});
   return ResultOk(NullSpec{});
 }
 
 Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& schema) {
-  WarnUnsupportedKeywords(schema, {"uniqueItems", "contains", "minContains", "maxContains"});
+  WarnUnsupportedKeywords(schema, {"uniqueItems", "contains", "minContains", "maxContains", "not"});
   ArraySpec spec;
 
   if (schema.count("prefixItems")) {
@@ -691,6 +1537,168 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
     }
     for (const auto& req : schema.at("required").get<picojson::array>()) {
       spec.required.insert(req.get<std::string>());
+    }
+  }
+
+  if (schema.count("dependentRequired")) {
+    if (!schema.at("dependentRequired").is<picojson::object>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "dependentRequired must be an object"
+      );
+    }
+    const auto& dependent_required_obj = schema.at("dependentRequired").get<picojson::object>();
+    for (const auto& key : dependent_required_obj.ordered_keys()) {
+      const auto& deps_value = dependent_required_obj.at(key);
+      if (!deps_value.is<picojson::array>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "dependentRequired values must be arrays"
+        );
+      }
+      std::vector<std::string> deps;
+      for (const auto& dep : deps_value.get<picojson::array>()) {
+        if (!dep.is<std::string>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema,
+              "dependentRequired arrays must contain only strings"
+          );
+        }
+        const auto& dep_name = dep.get<std::string>();
+        if (std::find(deps.begin(), deps.end(), dep_name) == deps.end()) {
+          deps.push_back(dep_name);
+        }
+      }
+      if (!deps.empty()) {
+        spec.dependent_required[key] = std::move(deps);
+      }
+    }
+  }
+
+  if (schema.count("not")) {
+    auto parse_required_only_object =
+        [](const picojson::value& value, const std::string& context
+        ) -> Result<std::vector<std::string>, SchemaError> {
+      if (!value.is<picojson::object>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, context + " must be an object"
+        );
+      }
+      const auto& obj = value.get<picojson::object>();
+      static const std::unordered_set<std::string> kIgnoredKeys = {
+          "title",
+          "default",
+          "description",
+          "examples",
+          "deprecated",
+          "readOnly",
+          "writeOnly",
+          "$comment",
+      };
+      bool has_required = obj.count("required");
+      if (!has_required) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, context + " must contain required"
+        );
+      }
+      for (const auto& key : obj.ordered_keys()) {
+        if (key == "required" || key == "type" || kIgnoredKeys.count(key) != 0) {
+          continue;
+        }
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            context + " only supports required with optional type=object"
+        );
+      }
+      if (obj.count("type")) {
+        if (!obj.at("type").is<std::string>() || obj.at("type").get<std::string>() != "object") {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, context + " type must be object"
+          );
+        }
+      }
+      if (!obj.at("required").is<picojson::array>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, context + " required must be an array"
+        );
+      }
+      std::vector<std::string> group;
+      for (const auto& item : obj.at("required").get<picojson::array>()) {
+        if (!item.is<std::string>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema,
+              context + " required must contain only strings"
+          );
+        }
+        const auto& name = item.get<std::string>();
+        if (std::find(group.begin(), group.end(), name) == group.end()) {
+          group.push_back(name);
+        }
+      }
+      return ResultOk(std::move(group));
+    };
+
+    const auto& not_value = schema.at("not");
+    if (!not_value.is<picojson::object>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "object not must be an object"
+      );
+    }
+    const auto& not_obj = not_value.get<picojson::object>();
+    static const std::unordered_set<std::string> kIgnoredNotKeys = {
+        "title",
+        "default",
+        "description",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "$comment",
+    };
+    auto validate_not_container_keys =
+        [&](bool allow_required, bool allow_anyof) -> Result<bool, SchemaError> {
+      for (const auto& key : not_obj.ordered_keys()) {
+        if ((allow_required && key == "required") || (allow_anyof && key == "anyOf") ||
+            key == "type" || kIgnoredNotKeys.count(key) != 0) {
+          continue;
+        }
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            "object not only supports required or anyOf of required groups"
+        );
+      }
+      if (not_obj.count("type")) {
+        if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, "object not type must be object"
+          );
+        }
+      }
+      return ResultOk(true);
+    };
+
+    if (not_obj.count("required")) {
+      auto validate_result = validate_not_container_keys(/*allow_required=*/true, /*allow_anyof=*/false);
+      if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
+      auto group_result = parse_required_only_object(not_value, "not");
+      if (group_result.IsErr()) return ResultErr(std::move(group_result).UnwrapErr());
+      spec.forbidden_groups.push_back(std::move(group_result).Unwrap());
+    } else if (not_obj.count("anyOf")) {
+      auto validate_result = validate_not_container_keys(/*allow_required=*/false, /*allow_anyof=*/true);
+      if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
+      if (!not_obj.at("anyOf").is<picojson::array>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "not anyOf must be an array"
+        );
+      }
+      for (const auto& option : not_obj.at("anyOf").get<picojson::array>()) {
+        auto group_result = parse_required_only_object(option, "not anyOf entry");
+        if (group_result.IsErr()) return ResultErr(std::move(group_result).UnwrapErr());
+        spec.forbidden_groups.push_back(std::move(group_result).Unwrap());
+      }
+    } else {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "object not only supports required or anyOf of required groups"
+      );
     }
   }
 
@@ -886,36 +1894,492 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ResolveRef(
   return ResultOk(resolved);
 }
 
-Result<AnyOfSpec, SchemaError> SchemaParser::ParseAnyOf(const picojson::object& schema) {
-  AnyOfSpec spec;
-  auto anyof_key = schema.count("anyOf") ? "anyOf" : "oneOf";
-  if (!schema.at(anyof_key).is<picojson::array>()) {
+Result<std::vector<SchemaSpecPtr>, SchemaError> SchemaParser::ParseCompositeOptions(
+    const picojson::object& schema,
+    const std::string& keyword,
+    const std::string& rule_name_prefix
+) {
+  if (!schema.at(keyword).is<picojson::array>()) {
     return ResultErr<SchemaError>(
-        SchemaErrorType::kInvalidSchema, std::string(anyof_key) + " must be an array"
+        SchemaErrorType::kInvalidSchema, keyword + " must be an array"
     );
   }
+
+  std::optional<SchemaSpecPtr> base_spec;
+  picojson::object base_schema = schema;
+  base_schema.erase(keyword);
+  if (!base_schema.empty()) {
+    auto base_result = Parse(picojson::value(base_schema), rule_name_prefix + "_base");
+    if (base_result.IsErr()) return ResultErr(std::move(base_result).UnwrapErr());
+    base_spec = std::move(base_result).Unwrap();
+  }
+
+  std::vector<SchemaSpecPtr> options;
   int idx = 0;
-  for (const auto& option : schema.at(anyof_key).get<picojson::array>()) {
-    auto option_result = Parse(option, "case_" + std::to_string(idx));
+  for (const auto& option : schema.at(keyword).get<picojson::array>()) {
+    auto option_result = Parse(option, rule_name_prefix + "_" + std::to_string(idx));
     if (option_result.IsErr()) return ResultErr(std::move(option_result).UnwrapErr());
-    spec.options.push_back(std::move(option_result).Unwrap());
+    auto option_spec = std::move(option_result).Unwrap();
+    if (base_spec.has_value()) {
+      auto merge_result = MergeSchemaSpecs(
+          *base_spec, option_spec, rule_name_prefix + "_merged_" + std::to_string(idx)
+      );
+      if (merge_result.IsErr()) {
+        auto err = std::move(merge_result).UnwrapErr();
+        if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+          ++idx;
+          continue;
+        }
+        return ResultErr<SchemaError>(std::move(err));
+      }
+      option_spec = std::move(merge_result).Unwrap();
+    }
+    options.push_back(std::move(option_spec));
     ++idx;
   }
+
+  if (options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        keyword + " options have no satisfiable intersection with sibling constraints"
+    );
+  }
+  return ResultOk(std::move(options));
+}
+
+Result<AnyOfSpec, SchemaError> SchemaParser::ParseAnyOf(const picojson::object& schema) {
+  AnyOfSpec spec;
+  auto options = ParseCompositeOptions(schema, "anyOf", "case");
+  if (options.IsErr()) return ResultErr(std::move(options).UnwrapErr());
+  spec.options = std::move(options).Unwrap();
   return ResultOk(std::move(spec));
+}
+
+Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiveObjectOneOf(
+    const picojson::object& schema, const std::string& rule_name_hint
+) {
+  if (!schema.at("oneOf").is<picojson::array>()) {
+    return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "oneOf must be an array");
+  }
+
+  picojson::object base_schema = schema;
+  base_schema.erase("oneOf");
+  if (base_schema.empty()) {
+    return ResultOk(std::nullopt);
+  }
+
+  auto base_result = Parse(picojson::value(base_schema), rule_name_hint + "_base");
+  if (base_result.IsErr()) return ResultErr(std::move(base_result).UnwrapErr());
+  auto base_spec = std::move(base_result).Unwrap();
+  if (!std::holds_alternative<ObjectSpec>(base_spec->spec)) {
+    return ResultOk(std::nullopt);
+  }
+
+  const auto& base_object = std::get<ObjectSpec>(base_spec->spec);
+  if (!base_object.pattern_properties.empty() || base_object.property_names ||
+      base_object.allow_additional_properties || base_object.allow_unevaluated_properties) {
+    return ResultOk(std::nullopt);
+  }
+
+  auto parse_required_group =
+      [](const picojson::value& value, const std::string& context
+      ) -> Result<std::vector<std::string>, SchemaError> {
+    if (!value.is<picojson::array>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, context + " must be an array"
+      );
+    }
+    std::vector<std::string> group;
+    for (const auto& item : value.get<picojson::array>()) {
+      if (!item.is<std::string>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, context + " must contain only strings"
+        );
+      }
+      const auto& name = item.get<std::string>();
+      if (std::find(group.begin(), group.end(), name) == group.end()) {
+        group.push_back(name);
+      }
+    }
+    return ResultOk(std::move(group));
+  };
+
+  struct PresencePredicate {
+    std::vector<std::string> required_group;
+    std::vector<std::vector<std::string>> forbidden_groups;
+    std::vector<ObjectSpec::Property> property_refinements;
+  };
+
+  std::vector<PresencePredicate> predicates;
+  std::vector<std::string> involved_properties;
+  auto append_unique_name = [](std::vector<std::string>* names, const std::string& name) {
+    if (std::find(names->begin(), names->end(), name) == names->end()) {
+      names->push_back(name);
+    }
+  };
+  auto is_ignorable_option_key = [](const std::string& key) {
+    static const std::unordered_set<std::string> kIgnoredKeys = {
+        "title",
+        "default",
+        "description",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "$comment",
+    };
+    return kIgnoredKeys.count(key) != 0;
+  };
+  auto parse_supported_not_groups =
+      [&](const picojson::value& value) -> Result<std::vector<std::vector<std::string>>, SchemaError> {
+    if (!value.is<picojson::object>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "oneOf not branch must be an object"
+      );
+    }
+    const auto& not_obj = value.get<picojson::object>();
+    std::vector<std::vector<std::string>> groups;
+    if (not_obj.count("required")) {
+      for (const auto& key : not_obj.ordered_keys()) {
+        if (key == "required" || key == "type" || is_ignorable_option_key(key)) {
+          continue;
+        }
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            "oneOf not branch only supports required or anyOf of required groups"
+        );
+      }
+      if (not_obj.count("type")) {
+        if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, "oneOf not branch type must be object"
+          );
+        }
+      }
+      auto required_result = parse_required_group(not_obj.at("required"), "required");
+      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
+      groups.push_back(std::move(required_result).Unwrap());
+      return ResultOk(std::move(groups));
+    }
+    if (!not_obj.count("anyOf") || !not_obj.at("anyOf").is<picojson::array>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "oneOf not branch only supports required or anyOf of required groups"
+      );
+    }
+    for (const auto& key : not_obj.ordered_keys()) {
+      if (key == "anyOf" || key == "type" || is_ignorable_option_key(key)) {
+        continue;
+      }
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "oneOf not branch only supports required or anyOf of required groups"
+      );
+    }
+    if (not_obj.count("type")) {
+      if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "oneOf not branch type must be object"
+        );
+      }
+    }
+    for (const auto& negated_option : not_obj.at("anyOf").get<picojson::array>()) {
+      if (!negated_option.is<picojson::object>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "oneOf not anyOf entries must be objects"
+        );
+      }
+      const auto& negated_obj = negated_option.get<picojson::object>();
+      if (!negated_obj.count("required") || negated_obj.size() != 1) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            "oneOf not anyOf entries must contain only required"
+        );
+      }
+      auto required_result = parse_required_group(negated_obj.at("required"), "required");
+      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
+      groups.push_back(std::move(required_result).Unwrap());
+    }
+    return ResultOk(std::move(groups));
+  };
+
+  for (const auto& option : schema.at("oneOf").get<picojson::array>()) {
+    if (!option.is<picojson::object>()) {
+      return ResultOk(std::nullopt);
+    }
+    const auto& option_obj = option.get<picojson::object>();
+    if (option_obj.count("type")) {
+      if (!option_obj.at("type").is<std::string>() ||
+          option_obj.at("type").get<std::string>() != "object") {
+        return ResultOk(std::nullopt);
+      }
+    }
+
+    for (const auto& key : option_obj.ordered_keys()) {
+      if (key == "required" || key == "properties" || key == "not" || key == "type" ||
+          is_ignorable_option_key(key)) {
+        continue;
+      }
+      return ResultOk(std::nullopt);
+    }
+
+    PresencePredicate predicate;
+    bool has_supported_constraint = false;
+    if (option_obj.count("required")) {
+      auto required_result = parse_required_group(option_obj.at("required"), "required");
+      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
+      predicate.required_group = std::move(required_result).Unwrap();
+      for (const auto& property_name : predicate.required_group) {
+        append_unique_name(&involved_properties, property_name);
+      }
+      has_supported_constraint = true;
+    }
+
+    if (option_obj.count("not")) {
+      auto forbidden_result = parse_supported_not_groups(option_obj.at("not"));
+      if (forbidden_result.IsErr()) return ResultErr(std::move(forbidden_result).UnwrapErr());
+      predicate.forbidden_groups = std::move(forbidden_result).Unwrap();
+      for (const auto& group : predicate.forbidden_groups) {
+        for (const auto& property_name : group) {
+          append_unique_name(&involved_properties, property_name);
+        }
+      }
+      has_supported_constraint = true;
+    }
+
+    if (!has_supported_constraint) {
+      return ResultOk(std::nullopt);
+    }
+
+    if (option_obj.count("properties")) {
+      if (!option_obj.at("properties").is<picojson::object>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "properties must be an object"
+        );
+      }
+      const auto& properties_obj = option_obj.at("properties").get<picojson::object>();
+      for (const auto& property_name : properties_obj.ordered_keys()) {
+        if (std::find(predicate.required_group.begin(), predicate.required_group.end(), property_name) ==
+                predicate.required_group.end() &&
+            !base_object.required.count(property_name)) {
+          return ResultOk(std::nullopt);
+        }
+        append_unique_name(&involved_properties, property_name);
+        auto property_result = Parse(properties_obj.at(property_name), property_name);
+        if (property_result.IsErr()) return ResultErr(std::move(property_result).UnwrapErr());
+        predicate.property_refinements.push_back({property_name, std::move(property_result).Unwrap()});
+      }
+    }
+
+    predicates.push_back(std::move(predicate));
+  }
+
+  if (involved_properties.empty()) {
+    return ResultOk(std::nullopt);
+  }
+  if (involved_properties.size() > 10) {
+    return ResultOk(std::nullopt);
+  }
+
+  std::unordered_map<std::string, ObjectSpec::Property> explicit_properties;
+  for (const auto& property : base_object.properties) {
+    explicit_properties[property.name] = property;
+  }
+  for (const auto& property_name : involved_properties) {
+    if (!explicit_properties.count(property_name)) {
+      return ResultOk(std::nullopt);
+    }
+  }
+
+  auto is_group_satisfied =
+      [](const std::vector<std::string>& group, const std::unordered_set<std::string>& present) {
+    return std::all_of(group.begin(), group.end(), [&](const std::string& property_name) {
+      return present.count(property_name);
+    });
+  };
+
+  AnyOfSpec exact_anyof;
+  uint64_t assignment_count = uint64_t{1} << involved_properties.size();
+  for (uint64_t mask = 0; mask < assignment_count; ++mask) {
+    std::unordered_set<std::string> present_properties;
+    for (size_t i = 0; i < involved_properties.size(); ++i) {
+      if (mask & (uint64_t{1} << i)) {
+        present_properties.insert(involved_properties[i]);
+      }
+    }
+
+    bool violates_base_required = false;
+    for (const auto& property_name : base_object.required) {
+      if (std::find(involved_properties.begin(), involved_properties.end(), property_name) !=
+              involved_properties.end() &&
+          !present_properties.count(property_name)) {
+        violates_base_required = true;
+        break;
+      }
+    }
+    if (violates_base_required) {
+      continue;
+    }
+
+    int matched_predicates = 0;
+    int matched_predicate_index = -1;
+    for (size_t predicate_idx = 0; predicate_idx < predicates.size(); ++predicate_idx) {
+      const auto& predicate = predicates[predicate_idx];
+      bool matched = predicate.required_group.empty() ||
+                     is_group_satisfied(predicate.required_group, present_properties);
+      if (matched) {
+        matched = std::all_of(
+            predicate.forbidden_groups.begin(),
+            predicate.forbidden_groups.end(),
+            [&](const std::vector<std::string>& group) {
+              return !is_group_satisfied(group, present_properties);
+            });
+      }
+      if (matched) {
+        matched_predicate_index = static_cast<int>(predicate_idx);
+        ++matched_predicates;
+        if (matched_predicates > 1) {
+          break;
+        }
+      }
+    }
+    if (matched_predicates != 1) {
+      continue;
+    }
+
+    ObjectSpec branch_spec = base_object;
+    branch_spec.properties.clear();
+    for (const auto& property : base_object.properties) {
+      bool is_involved =
+          std::find(involved_properties.begin(), involved_properties.end(), property.name) !=
+          involved_properties.end();
+      if (!is_involved || present_properties.count(property.name)) {
+        branch_spec.properties.push_back(property);
+      }
+    }
+    for (const auto& property_name : involved_properties) {
+      if (present_properties.count(property_name)) {
+        branch_spec.required.insert(property_name);
+      } else {
+        branch_spec.required.erase(property_name);
+      }
+    }
+
+    bool branch_is_unsatisfiable = false;
+    const auto& matched_predicate = predicates[matched_predicate_index];
+    for (const auto& refinement : matched_predicate.property_refinements) {
+      auto property_it = std::find_if(
+          branch_spec.properties.begin(),
+          branch_spec.properties.end(),
+          [&](const ObjectSpec::Property& property) { return property.name == refinement.name; }
+      );
+      if (property_it == branch_spec.properties.end()) {
+        branch_is_unsatisfiable = true;
+        break;
+      }
+      auto merge_result = MergeSchemaSpecs(
+          property_it->schema, refinement.schema, rule_name_hint + "_" + refinement.name
+      );
+      if (merge_result.IsErr()) {
+        auto err = std::move(merge_result).UnwrapErr();
+        if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+          branch_is_unsatisfiable = true;
+          break;
+        }
+        return ResultErr<SchemaError>(std::move(err));
+      }
+      property_it->schema = std::move(merge_result).Unwrap();
+    }
+    if (branch_is_unsatisfiable) {
+      continue;
+    }
+
+    if (branch_spec.max_properties != -1 &&
+        static_cast<int>(branch_spec.required.size()) > branch_spec.max_properties) {
+      continue;
+    }
+    if (branch_spec.max_properties != -1 && branch_spec.min_properties > branch_spec.max_properties) {
+      continue;
+    }
+    if (branch_spec.min_properties > static_cast<int>(branch_spec.properties.size())) {
+      continue;
+    }
+
+    exact_anyof.options.push_back(
+        SchemaSpec::Make(std::move(branch_spec), "", rule_name_hint + "_presence")
+    );
+  }
+
+  if (exact_anyof.options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        "oneOf presence constraints have no satisfiable exclusive branches"
+    );
+  }
+  if (exact_anyof.options.size() == 1) {
+    return ResultOk<std::optional<SchemaSpecPtr>>(exact_anyof.options[0]);
+  }
+  return ResultOk<std::optional<SchemaSpecPtr>>(
+      SchemaSpec::Make(std::move(exact_anyof), "", rule_name_hint)
+  );
+}
+
+Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseOneOf(
+    const picojson::object& schema, const std::string& rule_name_hint
+) {
+  auto exact_object_result = TryParseExclusiveObjectOneOf(schema, rule_name_hint);
+  if (exact_object_result.IsErr()) return ResultErr(std::move(exact_object_result).UnwrapErr());
+  auto exact_object_spec = std::move(exact_object_result).Unwrap();
+  if (exact_object_spec.has_value()) {
+    return ResultOk(*exact_object_spec);
+  }
+
+  OneOfSpec spec;
+  auto options = ParseCompositeOptions(schema, "oneOf", "case");
+  if (options.IsErr()) return ResultErr(std::move(options).UnwrapErr());
+  spec.options = std::move(options).Unwrap();
+  return ResultOk(SchemaSpec::Make(std::move(spec), "", rule_name_hint));
 }
 
 Result<AllOfSpec, SchemaError> SchemaParser::ParseAllOf(const picojson::object& schema) {
   AllOfSpec spec;
+  std::vector<SchemaSpecPtr> merge_candidates;
+
+  picojson::object base_schema = schema;
+  base_schema.erase("allOf");
+  if (!base_schema.empty()) {
+    auto base_result = Parse(picojson::value(base_schema), "all_base");
+    if (base_result.IsErr()) return ResultErr(std::move(base_result).UnwrapErr());
+    merge_candidates.push_back(std::move(base_result).Unwrap());
+  }
+
   if (!schema.at("allOf").is<picojson::array>()) {
     return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "allOf must be an array");
   }
   int idx = 0;
   for (const auto& sub_schema : schema.at("allOf").get<picojson::array>()) {
-    auto sub_result = Parse(sub_schema, "all_" + std::to_string(idx));
+    Result<SchemaSpecPtr, SchemaError> sub_result = [&]() -> Result<SchemaSpecPtr, SchemaError> {
+      if (!base_schema.empty() && sub_schema.is<picojson::object>()) {
+        const auto& sub_schema_obj = sub_schema.get<picojson::object>();
+        if (sub_schema_obj.count("oneOf")) {
+          picojson::object merged_sub_schema = base_schema;
+          for (const auto& key : sub_schema_obj.ordered_keys()) {
+            merged_sub_schema[key] = sub_schema_obj.at(key);
+          }
+          return ParseOneOf(merged_sub_schema, "all_" + std::to_string(idx));
+        }
+      }
+      return Parse(sub_schema, "all_" + std::to_string(idx));
+    }();
     if (sub_result.IsErr()) return ResultErr(std::move(sub_result).UnwrapErr());
-    spec.schemas.push_back(std::move(sub_result).Unwrap());
+    auto parsed = std::move(sub_result).Unwrap();
+    merge_candidates.push_back(std::move(parsed));
     ++idx;
   }
+
+  auto merged_result = MergeAllOfSchemas(merge_candidates, "all");
+  if (merged_result.IsErr()) return ResultErr(std::move(merged_result).UnwrapErr());
+  spec.schemas = {std::move(merged_result).Unwrap()};
   return ResultOk(std::move(spec));
 }
 
@@ -945,6 +2409,396 @@ Result<TypeArraySpec, SchemaError> SchemaParser::ParseTypeArray(
     spec.type_schemas.push_back(std::move(type_result).Unwrap());
   }
   return ResultOk(std::move(spec));
+}
+
+Result<bool, SchemaError> SchemaParser::AreSchemasDisjoint(
+    const SchemaSpecPtr& lhs, const SchemaSpecPtr& rhs, const std::string& rule_name_hint
+) {
+  auto merge_result = MergeSchemaSpecs(lhs, rhs, rule_name_hint);
+  if (merge_result.IsOk()) {
+    auto merged = std::move(merge_result).Unwrap();
+    if (std::holds_alternative<ObjectSpec>(merged->spec)) {
+      const auto& object = std::get<ObjectSpec>(merged->spec);
+      if (!object.dependent_required.empty() || !object.forbidden_groups.empty()) {
+        auto normalized_result =
+            NormalizeObjectPresenceConstraints(object, rule_name_hint + "_presence");
+        if (normalized_result.IsOk()) {
+          return ResultOk(false);
+        }
+        auto err = std::move(normalized_result).UnwrapErr();
+        if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+          return ResultOk(true);
+        }
+        return ResultErr<SchemaError>(std::move(err));
+      }
+    }
+    return ResultOk(false);
+  }
+  auto err = std::move(merge_result).UnwrapErr();
+  if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+    return ResultOk(true);
+  }
+  return ResultErr<SchemaError>(std::move(err));
+}
+
+Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeObjectPresenceConstraints(
+    const ObjectSpec& object, const std::string& rule_name_hint
+) {
+  constexpr size_t kMaxExactPresenceProperties = 10;
+  if (object.dependent_required.empty() && object.forbidden_groups.empty()) {
+    return ResultOk(SchemaSpec::Make(object, "", rule_name_hint));
+  }
+  if (!object.pattern_properties.empty() || object.property_names ||
+      object.allow_additional_properties || object.allow_unevaluated_properties) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema,
+        "object presence constraints are only supported for closed objects with explicit properties"
+    );
+  }
+
+  std::unordered_map<std::string, ObjectSpec::Property> explicit_properties;
+  for (const auto& property : object.properties) {
+    explicit_properties[property.name] = property;
+  }
+
+  std::vector<std::string> involved_properties;
+  auto append_unique_name = [](std::vector<std::string>* names, const std::string& name) {
+    if (std::find(names->begin(), names->end(), name) == names->end()) {
+      names->push_back(name);
+    }
+  };
+
+  for (const auto& [trigger, deps] : object.dependent_required) {
+    if (explicit_properties.count(trigger)) {
+      append_unique_name(&involved_properties, trigger);
+    }
+    for (const auto& dep : deps) {
+      if (explicit_properties.count(dep)) {
+        append_unique_name(&involved_properties, dep);
+      }
+    }
+  }
+  for (const auto& group : object.forbidden_groups) {
+    if (group.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kUnsatisfiableSchema,
+          "object presence constraints have no satisfiable assignments"
+      );
+    }
+    for (const auto& name : group) {
+      if (explicit_properties.count(name)) {
+        append_unique_name(&involved_properties, name);
+      }
+    }
+  }
+
+  if (involved_properties.empty()) {
+    ObjectSpec normalized = object;
+    normalized.dependent_required.clear();
+    normalized.forbidden_groups.clear();
+    return ResultOk(SchemaSpec::Make(std::move(normalized), "", rule_name_hint));
+  }
+  if (involved_properties.size() > kMaxExactPresenceProperties) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema,
+        "object presence constraints involve too many explicit properties to normalize exactly: " +
+            rule_name_hint
+    );
+  }
+
+  AnyOfSpec exact_anyof;
+  uint64_t assignment_count = uint64_t{1} << involved_properties.size();
+  for (uint64_t mask = 0; mask < assignment_count; ++mask) {
+    std::unordered_set<std::string> present_properties;
+    for (size_t i = 0; i < involved_properties.size(); ++i) {
+      if (mask & (uint64_t{1} << i)) {
+        present_properties.insert(involved_properties[i]);
+      }
+    }
+
+    bool violates_required = false;
+    for (const auto& property_name : object.required) {
+      bool is_involved =
+          std::find(involved_properties.begin(), involved_properties.end(), property_name) !=
+          involved_properties.end();
+      if (is_involved && !present_properties.count(property_name)) {
+        violates_required = true;
+        break;
+      }
+    }
+    if (violates_required) {
+      continue;
+    }
+
+    bool violates_dependency = false;
+    for (const auto& [trigger, deps] : object.dependent_required) {
+      if (!explicit_properties.count(trigger) || !present_properties.count(trigger)) {
+        continue;
+      }
+      for (const auto& dep : deps) {
+        if (!explicit_properties.count(dep) || !present_properties.count(dep)) {
+          violates_dependency = true;
+          break;
+        }
+      }
+      if (violates_dependency) {
+        break;
+      }
+    }
+    if (violates_dependency) {
+      continue;
+    }
+
+    bool violates_forbidden = false;
+    for (const auto& group : object.forbidden_groups) {
+      bool all_present = std::all_of(
+          group.begin(),
+          group.end(),
+          [&](const std::string& name) {
+            return explicit_properties.count(name) && present_properties.count(name);
+          }
+      );
+      if (all_present) {
+        violates_forbidden = true;
+        break;
+      }
+    }
+    if (violates_forbidden) {
+      continue;
+    }
+
+    ObjectSpec branch_spec = object;
+    branch_spec.dependent_required.clear();
+    branch_spec.forbidden_groups.clear();
+    branch_spec.properties.clear();
+    for (const auto& property : object.properties) {
+      bool is_involved =
+          std::find(involved_properties.begin(), involved_properties.end(), property.name) !=
+          involved_properties.end();
+      if (!is_involved || present_properties.count(property.name)) {
+        branch_spec.properties.push_back(property);
+      }
+    }
+    for (const auto& property_name : involved_properties) {
+      if (present_properties.count(property_name)) {
+        branch_spec.required.insert(property_name);
+      } else {
+        branch_spec.required.erase(property_name);
+      }
+    }
+
+    if (branch_spec.max_properties != -1 &&
+        static_cast<int>(branch_spec.required.size()) > branch_spec.max_properties) {
+      continue;
+    }
+    if (branch_spec.max_properties != -1 && branch_spec.min_properties > branch_spec.max_properties) {
+      continue;
+    }
+    if (branch_spec.min_properties > static_cast<int>(branch_spec.properties.size())) {
+      continue;
+    }
+
+    exact_anyof.options.push_back(
+        SchemaSpec::Make(std::move(branch_spec), "", rule_name_hint + "_presence_constraint")
+    );
+  }
+
+  if (exact_anyof.options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        "object presence constraints have no satisfiable assignments: " + rule_name_hint
+    );
+  }
+  if (exact_anyof.options.size() == 1) {
+    return ResultOk(exact_anyof.options[0]);
+  }
+  return ResultOk(SchemaSpec::Make(std::move(exact_anyof), "", rule_name_hint));
+}
+
+Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeExclusiveDisjunctions(
+    const SchemaSpecPtr& spec
+) {
+  std::unordered_set<const SchemaSpec*> active_specs;
+  std::unordered_set<const SchemaSpec*> normalized_specs;
+  return NormalizeExclusiveDisjunctionsImpl(
+      spec, "root", &active_specs, &normalized_specs
+  );
+}
+
+Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeExclusiveDisjunctionsImpl(
+    const SchemaSpecPtr& spec,
+    const std::string& rule_name_hint,
+    std::unordered_set<const SchemaSpec*>* active_specs,
+    std::unordered_set<const SchemaSpec*>* normalized_specs
+) {
+  if (!spec || normalized_specs->count(spec.get()) || active_specs->count(spec.get())) {
+    return ResultOk(spec);
+  }
+  active_specs->insert(spec.get());
+
+  auto finish_ok = [&]() -> Result<SchemaSpecPtr, SchemaError> {
+    active_specs->erase(spec.get());
+    normalized_specs->insert(spec.get());
+    return ResultOk(spec);
+  };
+  auto finish_err = [&](SchemaError err) -> Result<SchemaSpecPtr, SchemaError> {
+    active_specs->erase(spec.get());
+    return ResultErr<SchemaError>(std::move(err));
+  };
+
+  auto normalize_child = [&](const SchemaSpecPtr& child,
+                             const std::string& child_hint) -> Result<SchemaSpecPtr, SchemaError> {
+    return NormalizeExclusiveDisjunctionsImpl(child, child_hint, active_specs, normalized_specs);
+  };
+
+  if (std::holds_alternative<RefSpec>(spec->spec)) {
+    const auto& ref = std::get<RefSpec>(spec->spec);
+    auto resolved_result = ResolveRef(ref.uri, rule_name_hint + "_ref");
+    if (resolved_result.IsErr()) return finish_err(std::move(resolved_result).UnwrapErr());
+    auto normalized_result =
+        normalize_child(std::move(resolved_result).Unwrap(), rule_name_hint + "_target");
+    if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<AnyOfSpec>(spec->spec)) {
+    auto& anyof = std::get<AnyOfSpec>(spec->spec);
+    for (size_t i = 0; i < anyof.options.size(); ++i) {
+      auto normalized_result = normalize_child(
+          anyof.options[i], rule_name_hint + "_anyof_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      anyof.options[i] = std::move(normalized_result).Unwrap();
+    }
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<OneOfSpec>(spec->spec)) {
+    auto oneof = std::get<OneOfSpec>(spec->spec);
+    for (size_t i = 0; i < oneof.options.size(); ++i) {
+      auto normalized_result = normalize_child(
+          oneof.options[i], rule_name_hint + "_oneof_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      oneof.options[i] = std::move(normalized_result).Unwrap();
+    }
+
+    for (size_t i = 0; i < oneof.options.size(); ++i) {
+      for (size_t j = i + 1; j < oneof.options.size(); ++j) {
+        auto disjoint_result = AreSchemasDisjoint(
+            oneof.options[i],
+            oneof.options[j],
+            rule_name_hint + "_overlap_" + std::to_string(i) + "_" + std::to_string(j)
+        );
+        if (disjoint_result.IsErr()) {
+          auto err = std::move(disjoint_result).UnwrapErr();
+          return finish_err(SchemaError(
+              SchemaErrorType::kInvalidSchema,
+              std::string("oneOf branches could not be proven mutually exclusive: ") + err.what()
+          ));
+        }
+        if (!std::move(disjoint_result).Unwrap()) {
+          return finish_err(SchemaError(
+              SchemaErrorType::kInvalidSchema, "oneOf branches are not mutually exclusive"
+          ));
+        }
+      }
+    }
+
+    if (oneof.options.size() == 1) {
+      spec->spec = oneof.options[0]->spec;
+    } else {
+      spec->spec = AnyOfSpec{std::move(oneof.options)};
+    }
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<AllOfSpec>(spec->spec)) {
+    auto& allof = std::get<AllOfSpec>(spec->spec);
+    for (size_t i = 0; i < allof.schemas.size(); ++i) {
+      auto normalized_result = normalize_child(
+          allof.schemas[i], rule_name_hint + "_allof_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      allof.schemas[i] = std::move(normalized_result).Unwrap();
+    }
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<TypeArraySpec>(spec->spec)) {
+    auto& type_array = std::get<TypeArraySpec>(spec->spec);
+    for (size_t i = 0; i < type_array.type_schemas.size(); ++i) {
+      auto normalized_result = normalize_child(
+          type_array.type_schemas[i], rule_name_hint + "_type_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      type_array.type_schemas[i] = std::move(normalized_result).Unwrap();
+    }
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<ArraySpec>(spec->spec)) {
+    auto& array = std::get<ArraySpec>(spec->spec);
+    for (size_t i = 0; i < array.prefix_items.size(); ++i) {
+      auto normalized_result = normalize_child(
+          array.prefix_items[i], rule_name_hint + "_prefix_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      array.prefix_items[i] = std::move(normalized_result).Unwrap();
+    }
+    if (array.additional_items) {
+      auto normalized_result = normalize_child(array.additional_items, rule_name_hint + "_additional");
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      array.additional_items = std::move(normalized_result).Unwrap();
+    }
+    return finish_ok();
+  }
+
+  if (std::holds_alternative<ObjectSpec>(spec->spec)) {
+    auto& object = std::get<ObjectSpec>(spec->spec);
+    for (auto& property : object.properties) {
+      auto normalized_result =
+          normalize_child(property.schema, rule_name_hint + "_" + property.name);
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      property.schema = std::move(normalized_result).Unwrap();
+    }
+    for (size_t i = 0; i < object.pattern_properties.size(); ++i) {
+      auto normalized_result = normalize_child(
+          object.pattern_properties[i].schema, rule_name_hint + "_pattern_" + std::to_string(i)
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      object.pattern_properties[i].schema = std::move(normalized_result).Unwrap();
+    }
+    if (object.additional_properties_schema) {
+      auto normalized_result = normalize_child(
+          object.additional_properties_schema, rule_name_hint + "_additional"
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      object.additional_properties_schema = std::move(normalized_result).Unwrap();
+    }
+    if (object.unevaluated_properties_schema) {
+      auto normalized_result = normalize_child(
+          object.unevaluated_properties_schema, rule_name_hint + "_unevaluated"
+      );
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      object.unevaluated_properties_schema = std::move(normalized_result).Unwrap();
+    }
+    if (object.property_names) {
+      auto normalized_result =
+          normalize_child(object.property_names, rule_name_hint + "_property_names");
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      object.property_names = std::move(normalized_result).Unwrap();
+    }
+    if (!object.dependent_required.empty() || !object.forbidden_groups.empty()) {
+      auto normalized_result =
+          NormalizeObjectPresenceConstraints(object, rule_name_hint + "_presence");
+      if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
+      spec->spec = std::move(normalized_result).Unwrap()->spec;
+    }
+    return finish_ok();
+  }
+
+  return finish_ok();
 }
 
 }  // namespace
@@ -1265,17 +3119,32 @@ std::optional<std::string> JSONSchemaConverter::GetCache(const std::string& key)
 std::string JSONSchemaConverter::CreateRule(
     const SchemaSpecPtr& spec, const std::string& rule_name_hint
 ) {
-  // Only check cache for basic rules (pre-populated in AddBasicRules)
-  // Don't cache other rules to match original behavior
   auto cached = GetCache(spec->cache_key);
   if (cached.has_value()) {
     return cached.value();
   }
 
   std::string rule_name = ebnf_script_creator_.AllocateRuleName(rule_name_hint);
+  if (!spec->cache_key.empty()) {
+    AddCache(spec->cache_key, rule_name);
+  }
   std::string rule_body = GenerateFromSpec(spec, rule_name);
   ebnf_script_creator_.AddRuleWithAllocatedName(rule_name, rule_body);
 
+  return rule_name;
+}
+
+std::string JSONSchemaConverter::CreateGeneratedRule(
+    const std::string& rule_name_hint, const std::string& rule_body
+) {
+  auto it = generated_rule_body_cache_.find(rule_body);
+  if (it != generated_rule_body_cache_.end()) {
+    return it->second;
+  }
+
+  std::string rule_name = ebnf_script_creator_.AllocateRuleName(rule_name_hint);
+  ebnf_script_creator_.AddRuleWithAllocatedName(rule_name, rule_body);
+  generated_rule_body_cache_.emplace(rule_body, rule_name);
   return rule_name;
 }
 
@@ -1309,6 +3178,8 @@ std::string JSONSchemaConverter::GenerateFromSpec(
           return GenerateRef(s, rule_name_hint);
         } else if constexpr (std::is_same_v<T, AnyOfSpec>) {
           return GenerateAnyOf(s, rule_name_hint);
+        } else if constexpr (std::is_same_v<T, OneOfSpec>) {
+          return GenerateOneOf(s, rule_name_hint);
         } else if constexpr (std::is_same_v<T, AllOfSpec>) {
           return GenerateAllOf(s, rule_name_hint);
         } else if constexpr (std::is_same_v<T, TypeArraySpec>) {
@@ -1604,7 +3475,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
       std::string last_rule_body = "(" + mid_sep + " " + additional_prop_pattern + ")*";
       std::string last_rule_name =
           rule_name + "_part_" + std::to_string(static_cast<int>(properties.size()) - 1);
-      last_rule_name = ebnf_script_creator_.AddRule(last_rule_name, last_rule_body);
+      last_rule_name = CreateGeneratedRule(last_rule_name, last_rule_body);
       rule_names.back() = last_rule_name;
     } else {
       rule_names.back() = "\"\"";
@@ -1621,7 +3492,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
         is_required[i + 1] = true;
       }
       std::string cur_rule_name = rule_name + "_part_" + std::to_string(i);
-      cur_rule_name = ebnf_script_creator_.AddRule(cur_rule_name, cur_rule_body);
+      cur_rule_name = CreateGeneratedRule(cur_rule_name, cur_rule_body);
       rule_names[i] = cur_rule_name;
     }
     if (required.count(properties[0].name)) {
@@ -1696,7 +3567,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
         );
         std::string last_rule_name = rule_name + "_part_" + std::to_string(properties_size - 1) +
                                      "_" + std::to_string(matched);
-        last_rule_name = ebnf_script_creator_.AddRule(last_rule_name, last_rule_body);
+        last_rule_name = CreateGeneratedRule(last_rule_name, last_rule_body);
         rule_names.back().push_back(last_rule_name);
       }
     } else {
@@ -1720,7 +3591,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
         }
         std::string cur_rule_name =
             rule_name + "_part_" + std::to_string(i) + "_" + std::to_string(matched);
-        cur_rule_name = ebnf_script_creator_.AddRule(cur_rule_name, cur_rule_body);
+        cur_rule_name = CreateGeneratedRule(cur_rule_name, cur_rule_body);
         rule_names[i].push_back(cur_rule_name);
       }
     }
@@ -1816,7 +3687,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
         );
         std::string last_rule_name = rule_name + "_part_" + std::to_string(properties_size - 1) +
                                      "_" + std::to_string(matched);
-        last_rule_name = ebnf_script_creator_.AddRule(last_rule_name, last_rule_body);
+        last_rule_name = CreateGeneratedRule(last_rule_name, last_rule_body);
         rule_names.back().push_back(last_rule_name);
       }
     } else {
@@ -1842,7 +3713,7 @@ std::string JSONSchemaConverter::GetPartialRuleForProperties(
         }
         std::string cur_rule_name =
             rule_name + "_part_" + std::to_string(i) + "_" + std::to_string(matched);
-        cur_rule_name = ebnf_script_creator_.AddRule(cur_rule_name, cur_rule_body);
+        cur_rule_name = CreateGeneratedRule(cur_rule_name, cur_rule_body);
         rule_names[i].push_back(cur_rule_name);
       }
     }
@@ -1934,8 +3805,7 @@ std::string JSONSchemaConverter::GenerateObject(
             beg_seq + " " + key_pattern + " " + colon_pattern_ + " " + GetBasicAnyRuleName() + ")";
       }
 
-      auto prop_rule_name = ebnf_script_creator_.AllocateRuleName(rule_name + "_prop");
-      ebnf_script_creator_.AddRuleWithAllocatedName(prop_rule_name, property_rule_body);
+      auto prop_rule_name = CreateGeneratedRule(rule_name + "_prop", property_rule_body);
 
       result +=
           " " + prop_rule_name + " " +
@@ -2090,14 +3960,19 @@ std::string JSONSchemaConverter::GenerateAnyOf(
   return result;
 }
 
+std::string JSONSchemaConverter::GenerateOneOf(
+    const OneOfSpec&, const std::string& rule_name
+) {
+  XGRAMMAR_LOG(FATAL) << "OneOfSpec should be normalized before generation for " << rule_name;
+  return "";
+}
+
 std::string JSONSchemaConverter::GenerateAllOf(
     const AllOfSpec& spec, const std::string& rule_name
 ) {
-  if (spec.schemas.size() == 1) {
-    return GenerateFromSpec(spec.schemas[0], rule_name + "_case_0");
-  }
-  XGRAMMAR_LOG(WARNING) << "Support for allOf with multiple options is still ongoing";
-  return GenerateFromSpec(SchemaSpec::Make(AnySpec{}, "", "any"), rule_name);
+  XGRAMMAR_CHECK(spec.schemas.size() == 1)
+      << "AllOfSpec should be merged into a single schema before generation";
+  return GenerateFromSpec(spec.schemas[0], rule_name + "_case_0");
 }
 
 std::string JSONSchemaConverter::GenerateTypeArray(
@@ -2932,6 +4807,11 @@ std::string JSONSchemaToEBNF(
     XGRAMMAR_LOG(FATAL) << std::move(spec_result).UnwrapErr().what();
   }
   auto spec = std::move(spec_result).Unwrap();
+  auto normalized_result = parser.NormalizeExclusiveDisjunctions(spec);
+  if (normalized_result.IsErr()) {
+    XGRAMMAR_LOG(FATAL) << std::move(normalized_result).UnwrapErr().what();
+  }
+  spec = std::move(normalized_result).Unwrap();
 
   auto ref_resolver = [&parser](const std::string& uri, const std::string& rule_name_hint) {
     auto r = parser.ResolveRef(uri, rule_name_hint);

@@ -181,6 +181,7 @@ class GrammarCompiler(XGRObject):
             If specified, it will limit the number of whitespace characters to at most max_whitespace_cnt.
             It should be a positive integer.
 
+
         Returns
         -------
         compiled_grammar : CompiledGrammar
