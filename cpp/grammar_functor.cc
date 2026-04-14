@@ -1054,7 +1054,7 @@ class GrammarFSMBuilderImpl {
 
   void Apply(Grammar* grammar) {
     FSM complete_fsm;
-    std::vector<std::optional<FSMWithStartEnd>> per_rule_fsms((*grammar)->NumRules());
+    std::vector<std::optional<FSMWithStartEnd::SparseEndsInfo>> per_rule_fsms((*grammar)->NumRules());
     std::vector<int> state_mapping;
 
     for (int i = 0; i < (*grammar)->NumRules(); ++i) {
@@ -1063,17 +1063,21 @@ class GrammarFSMBuilderImpl {
       if (grammar_expr.type == Grammar::Impl::GrammarExprType::kTagDispatch) {
         auto rule_fsm = TagDispatch((*grammar)->GetTagDispatch(grammar_expr));
         XGRAMMAR_CHECK(rule_fsm.has_value()) << "Failed to build tag dispatch fsm for rule " << i;
-        per_rule_fsms[i] = rule_fsm->AddToCompleteFSM(&complete_fsm, &state_mapping);
+        per_rule_fsms[i] = rule_fsm->AddToCompleteFSMAndGetEndIndices(&complete_fsm, &state_mapping);
       } else if (grammar_expr.type == Grammar::Impl::GrammarExprType::kTokenTagDispatch) {
         auto rule_fsm = TokenTagDispatch((*grammar)->GetTokenTagDispatch(grammar_expr));
         XGRAMMAR_CHECK(rule_fsm.has_value())
             << "Failed to build token tag dispatch fsm for rule " << i;
-        per_rule_fsms[i] = rule_fsm->AddToCompleteFSM(&complete_fsm, &state_mapping);
+        per_rule_fsms[i] = rule_fsm->AddToCompleteFSMAndGetEndIndices(
+            &complete_fsm, &state_mapping
+        );
       } else {
         XGRAMMAR_DCHECK(grammar_expr.type == Grammar::Impl::GrammarExprType::kChoices);
         auto rule_fsm = Choices(grammar_expr, *grammar);
         if (rule_fsm.has_value()) {
-          per_rule_fsms[i] = rule_fsm->AddToCompleteFSM(&complete_fsm, &state_mapping);
+          per_rule_fsms[i] = rule_fsm->AddToCompleteFSMAndGetEndIndices(
+              &complete_fsm, &state_mapping
+          );
         }
       }
     }
@@ -1091,7 +1095,10 @@ class GrammarFSMBuilderImpl {
     for (int i = 0; i < (*grammar)->NumRules(); ++i) {
       if (per_rule_fsms[i]) {
         compact_per_rule_fsms[i] = CompactFSMWithStartEnd(
-            compact_complete_fsm, per_rule_fsms[i]->GetStart(), per_rule_fsms[i]->GetEnds()
+            compact_complete_fsm,
+            per_rule_fsms[i]->start,
+            std::move(per_rule_fsms[i]->end_indices),
+            per_rule_fsms[i]->is_dfa
         );
       }
     }

@@ -5,6 +5,8 @@
 
 #include <xgrammar/compiler.h>
 
+#include <algorithm>
+
 #include "compiled_grammar_impl.h"
 #include "support/json_serializer.h"
 #include "testing.h"
@@ -164,11 +166,52 @@ std::string AdaptiveTokenMask::Print(const TokenizerInfo& tokenizer_info) const 
 
 /************** CompiledGrammar::Impl **************/
 
+void CompiledGrammar::Impl::SetAdaptiveTokenMaskCache(AdaptiveTokenMaskCache cache) {
+  adaptive_token_masks.clear();
+  adaptive_token_mask_cache.clear();
+  adaptive_token_masks.reserve(cache.size());
+  adaptive_token_mask_cache.reserve(cache.size());
+
+  std::unordered_map<AdaptiveTokenMask, int32_t, AdaptiveTokenMaskHash> mask_to_id;
+  mask_to_id.reserve(cache.size());
+
+  for (auto& [state, mask] : cache) {
+    auto it = mask_to_id.find(mask);
+    if (it == mask_to_id.end()) {
+      const int32_t mask_id = static_cast<int32_t>(adaptive_token_masks.size());
+      adaptive_token_masks.push_back(std::move(mask));
+      mask_to_id.emplace(adaptive_token_masks.back(), mask_id);
+      adaptive_token_mask_cache.emplace(state, mask_id);
+    } else {
+      adaptive_token_mask_cache.emplace(state, it->second);
+    }
+  }
+}
+
 picojson::value SerializeJSONValue(const CompiledGrammar::Impl& impl) {
   auto result = picojson::object{};
   result["grammar"] = AutoSerializeJSONValue(impl.grammar);
   result["tokenizer_metadata"] = impl.tokenizer_info->DumpMetadataValue();
-  result["adaptive_token_mask_cache"] = AutoSerializeJSONValue(impl.adaptive_token_mask_cache);
+
+  std::vector<decltype(impl.adaptive_token_mask_cache.cbegin())> ptr_vec;
+  ptr_vec.reserve(impl.adaptive_token_mask_cache.size());
+  for (auto it = impl.adaptive_token_mask_cache.cbegin();
+       it != impl.adaptive_token_mask_cache.cend();
+       ++it) {
+    ptr_vec.push_back(it);
+  }
+  std::sort(ptr_vec.begin(), ptr_vec.end(), [](const auto& a, const auto& b) {
+    return a->first < b->first;
+  });
+  picojson::array adaptive_token_mask_cache_json;
+  adaptive_token_mask_cache_json.reserve(ptr_vec.size());
+  for (const auto& it : ptr_vec) {
+    const auto& [state, mask_id] = *it;
+    picojson::array entry{
+        AutoSerializeJSONValue(state), AutoSerializeJSONValue(impl.adaptive_token_masks.at(mask_id))};
+    adaptive_token_mask_cache_json.emplace_back(std::move(entry));
+  }
+  result["adaptive_token_mask_cache"] = picojson::value(std::move(adaptive_token_mask_cache_json));
   return picojson::value(result);
 }
 
@@ -199,14 +242,19 @@ std::optional<SerializationError> DeserializeJSONValue(
   if (object.find("adaptive_token_mask_cache") == object.end()) {
     return ConstructDeserializeError("Expect a 'adaptive_token_mask_cache' field", type_name);
   }
-  AutoDeserializeJSONValue(&(impl->adaptive_token_mask_cache), object["adaptive_token_mask_cache"]);
+  CompiledGrammar::Impl::AdaptiveTokenMaskCache adaptive_token_mask_cache;
+  AutoDeserializeJSONValue(
+      &adaptive_token_mask_cache, object["adaptive_token_mask_cache"], type_name
+  );
+  impl->SetAdaptiveTokenMaskCache(std::move(adaptive_token_mask_cache));
   return std::nullopt;
 }
 
 /************** CompiledGrammar **************/
 
 std::size_t MemorySize(const CompiledGrammar::Impl& impl) {
-  return MemorySize(impl.grammar) + MemorySize(impl.adaptive_token_mask_cache);
+  return MemorySize(impl.grammar) + MemorySize(impl.adaptive_token_masks) +
+         MemorySize(impl.adaptive_token_mask_cache);
 }
 
 std::size_t CompiledGrammar::MemorySizeBytes() const { return MemorySize(*pimpl_); }

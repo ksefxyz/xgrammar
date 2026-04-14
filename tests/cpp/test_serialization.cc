@@ -4,13 +4,21 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
+#include <xgrammar/compiler.h>
+#include <xgrammar/grammar.h>
+#include <xgrammar/tokenizer_info.h>
+
 #include "fsm.h"
+#include "grammar_impl.h"
 #include "support/compact_2d_array.h"
 #include "support/dynamic_bitset.h"
 #include "support/json_serializer.h"
+#include "support/memory_size.h"
+#include "tokenizer_info_impl.h"
 
 namespace xgrammar {
 
@@ -235,6 +243,30 @@ TEST(XGrammarSerializationTest, TestSTLAndBuiltinTypes) {
     auto json_value2 = AutoSerializeJSONValue(deserialized);
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
   }
+}
+
+TEST(XGrammarSerializationTest, TestCompiledGrammarMemorySizeAvoidsSharedFSMDoubleCount) {
+  using namespace xgrammar;
+
+  auto compiled =
+      GrammarCompiler(TokenizerInfo(std::vector<std::string>{}), 1, false).CompileBuiltinJSONGrammar();
+  const auto* grammar_impl = compiled.GetGrammar().ImplPtr();
+
+  const int per_rule_fsm_count = static_cast<int>(std::count_if(
+      grammar_impl->per_rule_fsms.begin(),
+      grammar_impl->per_rule_fsms.end(),
+      [](const auto& fsm) { return fsm.has_value(); }
+  ));
+  ASSERT_GT(per_rule_fsm_count, 10);
+  EXPECT_TRUE(grammar_impl->per_rule_fsm_hashes.empty());
+  EXPECT_TRUE(grammar_impl->per_rule_fsm_new_state_ids.empty());
+
+  const std::size_t complete_fsm_bytes = MemorySize(grammar_impl->complete_fsm);
+  ASSERT_GT(complete_fsm_bytes, 0U);
+  EXPECT_LT(
+      compiled.MemorySizeBytes(),
+      complete_fsm_bytes * static_cast<std::size_t>(per_rule_fsm_count) * 3 / 2
+  );
 }
 
 TEST(XGrammarSerializationTest, TestString) {
@@ -745,4 +777,35 @@ TEST(XGrammarSerializationTest, TestComplexStructures) {
     auto json_value2 = AutoSerializeJSONValue(deserialized);
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
   }
+}
+
+TEST(XGrammarSerializationTest, TestTokenizerFirstByteBoundaries) {
+  using namespace xgrammar;
+
+  const std::vector<std::string> vocab = {
+      "b",
+      "a",
+      "aa",
+      std::string("\x80", 1),
+      std::string("\x80z", 2),
+      std::string("\xff", 1),
+      "z"};
+  TokenizerInfo tokenizer_info(vocab, VocabType::RAW);
+
+  const auto& sorted_decoded_vocab = tokenizer_info.GetSortedDecodedVocab();
+  const auto& boundaries = tokenizer_info.ImplPtr()->GetFirstByteToSortedVocabBoundary();
+
+  auto compare_token = [](const std::pair<int32_t, std::string>& lhs, const std::string& rhs) {
+    return lhs.second < rhs;
+  };
+
+  for (int byte = 0; byte < 256; ++byte) {
+    std::string probe(1, static_cast<char>(static_cast<uint8_t>(byte)));
+    int32_t expected = static_cast<int32_t>(
+        std::lower_bound(sorted_decoded_vocab.begin(), sorted_decoded_vocab.end(), probe, compare_token) -
+        sorted_decoded_vocab.begin()
+    );
+    EXPECT_EQ(boundaries[byte], expected) << "byte=" << byte;
+  }
+  EXPECT_EQ(boundaries[256], static_cast<int32_t>(sorted_decoded_vocab.size()));
 }

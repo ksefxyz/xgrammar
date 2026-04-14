@@ -363,66 +363,34 @@ std::pair<bool, bool> GrammarMatcherForTokenMaskCache::IsTokenPassLookaheadAsser
   return {accepted, can_reach_end};
 }
 
-// Comparator for std::pair<int32_t, std::string> based on the string value.
-class IntStringPairComparator {
- public:
-  bool operator()(
-      const std::pair<int32_t, std::string>& lhs, const std::pair<int32_t, std::string>& rhs
-  ) const {
-    return lhs.second < rhs.second;
-  }
-};
-
 int GetPossibleTokenIntervals(
-    const std::vector<std::pair<int32_t, std::string>>& sorted_decoded_vocab,
+    const std::array<int32_t, 257>& first_byte_to_sorted_vocab_boundary,
     const std::bitset<256>& first_char_mask,
     std::vector<std::pair<int32_t, int32_t>>& possible_intervals
 ) {
   int possible_token_num = 0;
-  int matched_size = 0;
-  int last_interval_end = -1;
-  for (int32_t i = 0; i < 256; i++) {
-    if (first_char_mask[i]) {
-      if (last_interval_end == -1) {
-        last_interval_end = i;
+  int interval_start = -1;
+  for (int32_t byte = 0; byte < 256; ++byte) {
+    if (first_char_mask[byte]) {
+      if (interval_start == -1) {
+        interval_start = byte;
       }
     } else {
-      if (last_interval_end != -1) {
-        int32_t interval_left_end =
-            std::lower_bound(
-                sorted_decoded_vocab.begin() + matched_size,
-                sorted_decoded_vocab.end(),
-                std::make_pair(0, std::string(1, static_cast<uint8_t>(last_interval_end))),
-                IntStringPairComparator()
-            ) -
-            sorted_decoded_vocab.begin();
-        int32_t interval_right_end = std::lower_bound(
-                                         sorted_decoded_vocab.begin() + interval_left_end,
-                                         sorted_decoded_vocab.end(),
-                                         std::make_pair(0, std::string(1, static_cast<uint8_t>(i))),
-                                         IntStringPairComparator()
-                                     ) -
-                                     sorted_decoded_vocab.begin();
+      if (interval_start != -1) {
+        int32_t interval_left_end = first_byte_to_sorted_vocab_boundary[interval_start];
+        int32_t interval_right_end = first_byte_to_sorted_vocab_boundary[byte];
         possible_intervals.emplace_back(interval_left_end, interval_right_end);
         possible_token_num += interval_right_end - interval_left_end;
-        last_interval_end = -1;
-        matched_size = interval_right_end;
+        interval_start = -1;
       }
     }
   }
 
-  if (last_interval_end != -1) {
-    // If the last interval is not closed, we need to close it.
-    int32_t interval_left_end =
-        std::lower_bound(
-            sorted_decoded_vocab.begin() + matched_size,
-            sorted_decoded_vocab.end(),
-            std::make_pair(0, std::string(1, static_cast<uint8_t>(last_interval_end))),
-            IntStringPairComparator()
-        ) -
-        sorted_decoded_vocab.begin();
-    possible_intervals.emplace_back(interval_left_end, sorted_decoded_vocab.size());
-    possible_token_num += sorted_decoded_vocab.size() - interval_left_end;
+  if (interval_start != -1) {
+    int32_t interval_left_end = first_byte_to_sorted_vocab_boundary[interval_start];
+    int32_t interval_right_end = first_byte_to_sorted_vocab_boundary[256];
+    possible_intervals.emplace_back(interval_left_end, interval_right_end);
+    possible_token_num += interval_right_end - interval_left_end;
   }
   return possible_token_num;
 }
@@ -493,11 +461,14 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
     const std::vector<int32_t>& token_edge_accepted
 ) {
   const auto& sorted_decoded_vocab = tokenizer_info_.GetSortedDecodedVocab();
+  const auto& first_byte_to_sorted_vocab_boundary =
+      tokenizer_info_.ImplPtr()->GetFirstByteToSortedVocabBoundary();
   const auto& subtree_nodes_range = tokenizer_info_.GetTrieSubtreeNodesRange();
   // the pair (a, b) means [a, b). Intialize the possible intervals.
   std::vector<std::pair<int32_t, int32_t>> possible_intervals;
-  int possible_token_num =
-      GetPossibleTokenIntervals(sorted_decoded_vocab, first_char_mask, possible_intervals);
+  int possible_token_num = GetPossibleTokenIntervals(
+      first_byte_to_sorted_vocab_boundary, first_char_mask, possible_intervals
+  );
 
   // Check if the type of the mask can be rejected.
   tmp_accepted_indices_.reserve(possible_token_num);
@@ -1068,6 +1039,7 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
   // not need ThreadPool or std::mutex, which throws error in runtime in WebAssembly.
   std::optional<ThreadPool> thread_pool;
   std::optional<std::mutex> adaptive_token_mask_cache_mutex;
+  CompiledGrammar::Impl::AdaptiveTokenMaskCache adaptive_token_mask_cache;
   if (max_threads_ > 1) {
     thread_pool.emplace(max_threads_);
     adaptive_token_mask_cache_mutex.emplace();
@@ -1085,9 +1057,9 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     auto cur_adaptive_token_mask_cache = grammar_matcher.GetAdaptiveTokenMask(is_root_rule);
     if (max_threads_ > 1) {
       std::lock_guard<std::mutex> lock(adaptive_token_mask_cache_mutex.value());
-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      adaptive_token_mask_cache[state] = std::move(cur_adaptive_token_mask_cache);
     } else {
-      compiled_grammar_impl->adaptive_token_mask_cache[state] = cur_adaptive_token_mask_cache;
+      adaptive_token_mask_cache[state] = std::move(cur_adaptive_token_mask_cache);
     }
   };
 
@@ -1109,6 +1081,7 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     auto rule = compiled_grammar_impl->grammar->GetRule(rule_id);
     const auto& rule_fsm = compiled_grammar_impl->grammar->per_rule_fsms[rule_id];
     XGRAMMAR_DCHECK(rule_fsm.has_value());
+    bool is_root_rule = rule_id == root_rule_id;
     auto cur_stack_element =
         ParserState(rule_id, rule.body_expr_id, 0, ParserState::kNoPrevInputPos, 0);
     std::unordered_set<int> reachable_states;
@@ -1118,13 +1091,18 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
       if (!rule_fsm->IsScanableState(i)) {
         continue;
       }
-      add_task_adaptive_token_mask(cur_stack_element, rule_id == root_rule_id);
+      add_task_adaptive_token_mask(cur_stack_element, is_root_rule);
     }
   }
 
   if (max_threads_ > 1) {
     thread_pool->Join();
   }
+  compiled_grammar_impl->SetAdaptiveTokenMaskCache(std::move(adaptive_token_mask_cache));
+  std::vector<std::optional<uint64_t>>().swap(compiled_grammar_impl->grammar->per_rule_fsm_hashes);
+  std::vector<std::vector<std::pair<int32_t, int32_t>>>().swap(
+      compiled_grammar_impl->grammar->per_rule_fsm_new_state_ids
+  );
 
   return CompiledGrammar(compiled_grammar_impl);
 }

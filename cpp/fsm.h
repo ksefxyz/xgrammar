@@ -720,6 +720,12 @@ class FSMWithStartEndBase {
  */
 class FSMWithStartEnd : public FSMWithStartEndBase<FSM> {
  public:
+  struct SparseEndsInfo {
+    int start;
+    std::vector<int32_t> end_indices;
+    bool is_dfa;
+  };
+
   using FSMWithStartEndBase<FSM>::FSMWithStartEndBase;
 
   /*!
@@ -756,6 +762,10 @@ class FSMWithStartEnd : public FSMWithStartEndBase<FSM> {
    * \return The FSMWithStartEnd that points to the complete FSM.
    */
   FSMWithStartEnd AddToCompleteFSM(FSM* complete_fsm, std::vector<int>* state_mapping);
+
+  SparseEndsInfo AddToCompleteFSMAndGetEndIndices(
+      FSM* complete_fsm, std::vector<int>* state_mapping
+  );
 
   /*!
    * \brief Transform the FSMWithStartEnd to a CompactFSMWithStartEnd.
@@ -819,6 +829,17 @@ class FSMWithStartEnd : public FSMWithStartEndBase<FSM> {
    */
   bool IsDFA();
 
+  std::vector<int32_t> GetEndIndices() const {
+    std::vector<int32_t> end_indices;
+    end_indices.reserve(std::count(ends_.begin(), ends_.end(), true));
+    for (int end = 0; end < NumStates(); ++end) {
+      if (IsEndState(end)) {
+        end_indices.push_back(end);
+      }
+    }
+    return end_indices;
+  }
+
   /*!
    * \brief Merge some states by removing some epsilon transitions.
    * \details If a --\epsilon--> b, and either 1) b doesn't have any other inward edges, or
@@ -857,18 +878,43 @@ class FSMWithStartEnd : public FSMWithStartEndBase<FSM> {
  */
 class CompactFSMWithStartEnd : public FSMWithStartEndBase<CompactFSM> {
  public:
+  using Base = FSMWithStartEndBase<CompactFSM>;
   // For serialization only
   CompactFSMWithStartEnd() = default;
 
   explicit CompactFSMWithStartEnd(const CompactFSM& fsm, int start, const std::vector<bool>& ends)
-      : FSMWithStartEndBase<CompactFSM>(fsm, start, ends) {
+      : Base(fsm, start, {}) {
+    end_indices_.reserve(ends.size());
+    for (int i = 0; i < static_cast<int>(ends.size()); ++i) {
+      if (ends[i]) {
+        end_indices_.push_back(i);
+      }
+    }
     edge_num_ = 0;
     for (int i = 0; i < fsm.NumStates(); i++) {
       edge_num_ += fsm.GetEdges(i).size();
     }
   }
 
-  using FSMWithStartEndBase<CompactFSM>::FSMWithStartEndBase;
+  CompactFSMWithStartEnd(
+      const CompactFSM& fsm, int start, std::vector<int32_t> end_indices, bool is_dfa
+  )
+      : Base(fsm, start, {}, is_dfa), end_indices_(std::move(end_indices)) {
+    edge_num_ = 0;
+    for (int i = 0; i < fsm.NumStates(); i++) {
+      edge_num_ += fsm.GetEdges(i).size();
+    }
+  }
+
+  bool AcceptString(const std::string& str) const;
+
+  const std::vector<bool>& GetEnds() const;
+
+  bool IsEndState(int state) const {
+    return std::binary_search(end_indices_.begin(), end_indices_.end(), state);
+  }
+
+  const std::vector<int32_t>& GetEndIndices() const { return end_indices_; }
 
   /*!
    * \brief Convert the FSMWithStartEnd to a string. Only considers the nodes approachable from the
@@ -891,6 +937,9 @@ class CompactFSMWithStartEnd : public FSMWithStartEndBase<CompactFSM> {
 
  private:
   size_t edge_num_ = 0;
+  std::vector<int32_t> end_indices_;
+  mutable std::vector<bool> materialized_ends_;
+  mutable bool materialized_ends_valid_ = false;
 
   /*!
    * \brief Print the CompactFSMWithStartEnd.

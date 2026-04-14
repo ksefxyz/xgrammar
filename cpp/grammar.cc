@@ -6,6 +6,7 @@
 #include <xgrammar/grammar.h>
 
 #include <string>
+#include <unordered_set>
 
 #include "grammar_functor.h"
 #include "grammar_parser.h"
@@ -21,13 +22,38 @@ namespace xgrammar {
 
 /******************* Grammar::Impl *******************/
 
+namespace {
+
+std::size_t MemorySizeSharedPerRuleFSMViews(
+    const std::vector<std::optional<CompactFSMWithStartEnd>>& per_rule_fsms
+) {
+  std::size_t size = 0;
+  std::unordered_set<const CompactFSM::Impl*> counted_fsms;
+  counted_fsms.reserve(per_rule_fsms.size());
+  for (const auto& per_rule_fsm : per_rule_fsms) {
+    if (!per_rule_fsm.has_value()) {
+      continue;
+    }
+    size += MemorySize(per_rule_fsm->GetEndIndices());
+    const auto* fsm_impl = per_rule_fsm->GetFsm().ImplPtr();
+    if (fsm_impl != nullptr && counted_fsms.insert(fsm_impl).second) {
+      size += MemorySize(per_rule_fsm->GetFsm());
+    }
+  }
+  return size;
+}
+
+}  // namespace
+
 std::size_t MemorySize(const Grammar::Impl& impl) {
   /// TODO: Now, we evaluatve memory size of rule strings as sizeof(std::string),
   /// with an assumption that the string is small.
   /// This should be improved in the future.
   return impl.rules_.size() * sizeof(std::string) + MemorySize(impl.grammar_expr_data_) +
          MemorySize(impl.grammar_expr_indptr_) + MemorySize(impl.complete_fsm) +
-         MemorySize(impl.per_rule_fsms) + MemorySize(impl.allow_empty_rule_ids);
+         MemorySizeSharedPerRuleFSMViews(impl.per_rule_fsms) +
+         MemorySize(impl.per_rule_fsm_hashes) + MemorySize(impl.per_rule_fsm_new_state_ids) +
+         MemorySize(impl.allow_empty_rule_ids);
 }
 
 /******************* Grammar *******************/

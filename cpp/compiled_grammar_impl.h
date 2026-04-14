@@ -18,6 +18,7 @@
 #include "earley_parser.h"
 #include "support/dynamic_bitset.h"
 #include "support/reflection.h"
+#include "support/utils.h"
 #include "xgrammar/compiler.h"
 #include "xgrammar/exception.h"
 
@@ -79,9 +80,27 @@ struct AdaptiveTokenMask {
 
   std::string Print(const TokenizerInfo& tokenizer_info) const;
 
+  bool operator==(const AdaptiveTokenMask& other) const {
+    return store_type == other.store_type && accepted_indices == other.accepted_indices &&
+           rejected_indices == other.rejected_indices && accepted_bitset == other.accepted_bitset &&
+           uncertain_indices == other.uncertain_indices;
+  }
+
   friend std::size_t MemorySize(const AdaptiveTokenMask& mask) {
     return MemorySize(mask.uncertain_indices) + MemorySize(mask.accepted_indices) +
            MemorySize(mask.rejected_indices) + MemorySize(mask.accepted_bitset);
+  }
+};
+
+struct AdaptiveTokenMaskHash {
+  std::size_t operator()(const AdaptiveTokenMask& mask) const noexcept {
+    return HashCombine(
+        static_cast<int>(mask.store_type),
+        std::hash<std::vector<int32_t>>{}(mask.accepted_indices),
+        std::hash<std::vector<int32_t>>{}(mask.rejected_indices),
+        mask.accepted_bitset.Hash(),
+        std::hash<std::vector<int32_t>>{}(mask.uncertain_indices)
+    );
   }
 };
 
@@ -115,9 +134,24 @@ class CompiledGrammar::Impl {
   /*! \brief Default constructor. */
   Impl() = default;
 
+  using AdaptiveTokenMaskCache = std::unordered_map<
+      ParserState,
+      AdaptiveTokenMask,
+      StateHashForCache,
+      StateEqualForCache>;
+
+  /*! \brief Interned adaptive token masks referenced by parser states. */
+  std::vector<AdaptiveTokenMask> adaptive_token_masks;
+
   /*! \brief Mapping from the parser state to the adaptive token mask. */
-  std::unordered_map<ParserState, AdaptiveTokenMask, StateHashForCache, StateEqualForCache>
+  std::unordered_map<ParserState, int32_t, StateHashForCache, StateEqualForCache>
       adaptive_token_mask_cache;
+
+  void SetAdaptiveTokenMaskCache(AdaptiveTokenMaskCache cache);
+
+  const AdaptiveTokenMask& GetAdaptiveTokenMask(const ParserState& state) const {
+    return adaptive_token_masks.at(adaptive_token_mask_cache.at(state));
+  }
 
   Grammar GetGrammar() const { return grammar; }
 
@@ -139,6 +173,8 @@ XGRAMMAR_MEMBER_TABLE(
     &CompiledGrammar::Impl::grammar,
     "tokenizer_info",
     &CompiledGrammar::Impl::tokenizer_info,
+    "adaptive_token_masks",
+    &CompiledGrammar::Impl::adaptive_token_masks,
     "adaptive_token_mask_cache",
     &CompiledGrammar::Impl::adaptive_token_mask_cache
 );

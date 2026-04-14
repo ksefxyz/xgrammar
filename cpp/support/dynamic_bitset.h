@@ -21,6 +21,7 @@
 
 #include "json_serializer.h"
 #include "logging.h"
+#include "utils.h"
 
 namespace xgrammar {
 
@@ -284,6 +285,14 @@ class DynamicBitset {
       if (GetValidBits(i) != other.GetValidBits(i)) return false;
     }
     return true;
+  }
+
+  std::size_t Hash() const {
+    uint64_t seed = HashCombine(size_, buffer_size_);
+    for (int i = 0; i < buffer_size_; ++i) {
+      HashCombineBinary(seed, GetValidBits(i));
+    }
+    return static_cast<std::size_t>(seed);
   }
 
  private:

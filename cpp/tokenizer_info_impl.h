@@ -3,6 +3,7 @@
 
 #include <picojson.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_set>
@@ -38,6 +39,9 @@ class TokenizerInfo::Impl {
   const std::vector<int32_t>& GetTrieSubtreeNodesRange() const { return trie_subtree_nodes_range_; }
   const std::vector<int32_t>& GetTokenIdToSortedVocabIndex() const {
     return token_id_to_sorted_vocab_index_;
+  }
+  const std::array<int32_t, 257>& GetFirstByteToSortedVocabBoundary() const {
+    return first_byte_to_sorted_vocab_boundary_;
   }
 
   std::string DumpMetadata() const;
@@ -79,6 +83,9 @@ class TokenizerInfo::Impl {
   std::vector<int32_t> special_token_ids_;
   /*! \brief Reverse mapping: token_id -> index in sorted_decoded_vocab_. -1 if not present. */
   std::vector<int32_t> token_id_to_sorted_vocab_index_;
+  /*! \brief For each byte b in [0, 255], stores the first sorted vocab index whose first byte is
+   * >= b. Entry 256 stores sorted_decoded_vocab_.size(). */
+  std::array<int32_t, 257> first_byte_to_sorted_vocab_boundary_{};
 
   /*!
    * \brief The tokens used to detect stop tokens from the vocabulary.

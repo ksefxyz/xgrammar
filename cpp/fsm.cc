@@ -818,14 +818,8 @@ struct CompactFSMWithStartEndSerializeHelper {
       : fsm(compact_fsm_with_se.fsm_),
         start(compact_fsm_with_se.start_),
         is_dfa(compact_fsm_with_se.is_dfa_),
-        edge_num(compact_fsm_with_se.edge_num_) {
-    end_index.reserve(compact_fsm_with_se.NumStates());
-    for (int i = 0; i < static_cast<int>(compact_fsm_with_se.ends_.size()); ++i) {
-      if (compact_fsm_with_se.ends_[i]) {
-        end_index.push_back(i);
-      }
-    }
-  }
+        end_index(compact_fsm_with_se.end_indices_),
+        edge_num(compact_fsm_with_se.edge_num_) {}
 
   CompactFSMWithStartEndSerializeHelper() = default;
 };
@@ -854,11 +848,9 @@ std::optional<SerializationError> DeserializeJSONValue(
   result->start_ = tmp.start;
   result->is_dfa_ = tmp.is_dfa;
   result->edge_num_ = tmp.edge_num;
-  const auto& end_index = tmp.end_index;
-  result->ends_.resize(result->fsm_.NumStates(), false);
-  for (const auto& idx : end_index) {
-    result->ends_[idx] = true;
-  }
+  result->end_indices_ = std::move(tmp.end_index);
+  result->materialized_ends_.clear();
+  result->materialized_ends_valid_ = false;
   return std::nullopt;
 }
 
@@ -914,7 +906,7 @@ FSMWithStartEnd FSMWithStartEnd::RebuildWithMapping(
 }
 
 CompactFSMWithStartEnd FSMWithStartEnd::ToCompact() {
-  return CompactFSMWithStartEnd(fsm_.ToCompact(), start_, ends_);
+  return CompactFSMWithStartEnd(fsm_.ToCompact(), start_, GetEndIndices(), is_dfa_);
 }
 
 FSMWithStartEnd FSMWithStartEnd::AddToCompleteFSM(
@@ -930,6 +922,21 @@ FSMWithStartEnd FSMWithStartEnd::AddToCompleteFSM(
     }
   }
   return FSMWithStartEnd(*complete_fsm, new_start, new_ends, is_dfa_);
+}
+
+FSMWithStartEnd::SparseEndsInfo FSMWithStartEnd::AddToCompleteFSMAndGetEndIndices(
+    FSM* complete_fsm, std::vector<int>* state_mapping
+) {
+  XGRAMMAR_DCHECK(state_mapping != nullptr) << "state_mapping cannot be nullptr";
+  complete_fsm->AddFSM(fsm_, state_mapping);
+  SparseEndsInfo result{(*state_mapping)[start_], {}, is_dfa_};
+  result.end_indices.reserve(std::count(ends_.begin(), ends_.end(), true));
+  for (int end = 0; end < NumStates(); ++end) {
+    if (IsEndState(end)) {
+      result.end_indices.push_back((*state_mapping)[end]);
+    }
+  }
+  return result;
 }
 
 FSMWithStartEnd FSMWithStartEnd::Star() const {
@@ -1785,6 +1792,40 @@ Result<FSMWithStartEnd> FSMWithStartEnd::ToDFA(int max_num_states) const {
 
 /****************** CompactFSMWithStartEnd ******************/
 
+bool CompactFSMWithStartEnd::AcceptString(const std::string& str) const {
+  std::unordered_set<int> start_states{start_};
+  fsm_.GetEpsilonClosure(&start_states);
+  std::unordered_set<int> result_states;
+  for (const auto& character : str) {
+    result_states.clear();
+    fsm_.Advance(
+        start_states,
+        static_cast<int>(static_cast<unsigned char>(character)),
+        &result_states,
+        FSMEdge::EdgeType::kCharRange,
+        false
+    );
+    if (result_states.empty()) {
+      return false;
+    }
+    start_states = result_states;
+  }
+  return std::any_of(start_states.begin(), start_states.end(), [&](int state) {
+    return IsEndState(state);
+  });
+}
+
+const std::vector<bool>& CompactFSMWithStartEnd::GetEnds() const {
+  if (!materialized_ends_valid_) {
+    materialized_ends_.assign(fsm_.NumStates(), false);
+    for (int end_index : end_indices_) {
+      materialized_ends_[end_index] = true;
+    }
+    materialized_ends_valid_ = true;
+  }
+  return materialized_ends_;
+}
+
 std::string CompactFSMWithStartEnd::ToString() const {
   std::string result;
   result += "CompactFSM(num_states=" + std::to_string(NumStates()) +
@@ -1795,8 +1836,8 @@ std::string CompactFSMWithStartEnd::ToString() const {
   std::vector<int> reachable_states_vec(reachable_states.begin(), reachable_states.end());
   std::sort(reachable_states_vec.begin(), reachable_states_vec.end());
   bool first = true;
-  for (int end = 0; end < NumStates(); end++) {
-    if (reachable_states.count(end) && IsEndState(end)) {
+  for (int end : end_indices_) {
+    if (reachable_states.count(end)) {
       if (!first) {
         result += ", ";
       }
@@ -1817,11 +1858,11 @@ std::ostream& operator<<(std::ostream& os, const CompactFSMWithStartEnd& fsm) {
 std::size_t MemorySize(const CompactFSM& self) { return MemorySize(*self.ImplPtr()); }
 
 std::size_t MemorySize(const CompactFSMWithStartEnd& self) {
-  return MemorySize(self.fsm_) + MemorySize(self.ends_);
+  return MemorySize(self.fsm_) + MemorySize(self.end_indices_) + MemorySize(self.materialized_ends_);
 }
 
 FSMWithStartEnd CompactFSMWithStartEnd::ToFSM() const {
-  return FSMWithStartEnd(fsm_.ToFSM(), start_, ends_);
+  return FSMWithStartEnd(fsm_.ToFSM(), start_, GetEnds());
 }
 
 size_t CompactFSMWithStartEnd::GetNumEdges() const { return edge_num_; }
