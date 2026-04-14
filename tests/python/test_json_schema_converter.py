@@ -1247,6 +1247,81 @@ def test_if_then_anyof_required_alternatives():
     check_schema_with_instance(schema, {"RodzajFaktury": "VAT"}, any_whitespace=False)
 
 
+def test_allof_discriminator_family_is_compacted_without_losing_semantics():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR", "ZAL"]},
+            "P_15": {"type": "number"},
+            "FaWiersz": {"type": "string"},
+            "Zamowienie": {"type": "string"},
+        },
+        "required": ["RodzajFaktury"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "VAT"}},
+                    "required": ["RodzajFaktury"],
+                },
+                "then": {
+                    "required": ["FaWiersz"],
+                    "not": {"anyOf": [{"required": ["P_15"]}, {"required": ["Zamowienie"]}]},
+                },
+            },
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "UPR"}},
+                    "required": ["RodzajFaktury"],
+                },
+                "then": {
+                    "anyOf": [{"required": ["P_15"]}, {"required": ["FaWiersz"]}],
+                    "not": {"required": ["Zamowienie"]},
+                },
+            },
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "ZAL"}},
+                    "required": ["RodzajFaktury"],
+                },
+                "then": {
+                    "required": ["P_15", "Zamowienie"],
+                    "not": {"required": ["FaWiersz"]},
+                },
+            },
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "P_15": 100}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "ZAL", "P_15": 100, "Zamowienie": "zam"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "P_15": 100}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "UPR", "P_15": 100, "Zamowienie": "zam"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "ZAL", "P_15": 100, "FaWiersz": "wiersz", "Zamowienie": "zam"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
 def test_if_then_else_anyof_required_alternatives():
     schema = {
         "type": "object",

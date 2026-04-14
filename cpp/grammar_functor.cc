@@ -611,7 +611,8 @@ class RuleInlinerImpl : public GrammarMutator {
       XGRAMMAR_ICHECK(choice_expr.type == GrammarExprType::kSequence);
       for (auto element_id : choice_expr) {
         auto element_expr = base_grammar_->GetGrammarExpr(element_id);
-        if (element_expr.type == GrammarExprType::kRuleRef) {
+        if (element_expr.type == GrammarExprType::kRuleRef ||
+            element_expr.type == GrammarExprType::kRepeat) {
           return false;
         }
       }
@@ -749,6 +750,7 @@ class LookaheadAssertionAnalyzerImpl : public GrammarMutator {
         root_grammar_expr.type == GrammarExprType::kTokenTagDispatch) {
       return grammar;
     }
+    BuildRuleUsageInfo();
     for (int i = 0; i < static_cast<int>(grammar->NumRules()); ++i) {
       auto rule = grammar->GetRule(i);
       if (i == grammar->GetRootRuleId()) {
@@ -767,113 +769,83 @@ class LookaheadAssertionAnalyzerImpl : public GrammarMutator {
     return builder_->Get(grammar->GetRootRuleId());
   }
 
-  bool IsExactLookaheadAssertion(int32_t rule_id) {
-    XGRAMMAR_DCHECK(base_grammar_->GetRule(rule_id).lookahead_assertion_id != -1);
-    bool found = false;
+ private:
+  struct RuleUsageInfo {
+    bool referenced_in_tag_dispatch = false;
+    bool referenced_in_token_tag_dispatch = false;
+    bool referenced_as_last_in_other_rule = false;
+    int32_t non_last_ref_count = 0;
+    std::vector<int32_t> first_non_last_suffix;
+  };
+
+  std::vector<RuleUsageInfo> rule_usage_info_;
+
+  void BuildRuleUsageInfo() {
+    rule_usage_info_.assign(base_grammar_->NumRules(), {});
     for (int i = 0; i < static_cast<int>(base_grammar_->NumRules()); ++i) {
       auto rule = base_grammar_->GetRule(i);
       auto grammar_expr = base_grammar_->GetGrammarExpr(rule.body_expr_id);
       if (grammar_expr.type == GrammarExprType::kTagDispatch) {
         auto tag_dispatch = base_grammar_->GetTagDispatch(grammar_expr);
         for (const auto& [trigger, rid] : tag_dispatch.tag_rule_pairs) {
-          if (rid == rule_id) {
-            return false;
-          }
+          rule_usage_info_[rid].referenced_in_tag_dispatch = true;
         }
         continue;
       }
       if (grammar_expr.type == GrammarExprType::kTokenTagDispatch) {
-        auto ttd = base_grammar_->GetTokenTagDispatch(grammar_expr);
-        for (const auto& [token_id, rid] : ttd.trigger_rule_pairs) {
-          if (rid == rule_id) {
-            return false;
-          }
+        auto token_tag_dispatch = base_grammar_->GetTokenTagDispatch(grammar_expr);
+        for (const auto& [token_id, rid] : token_tag_dispatch.trigger_rule_pairs) {
+          rule_usage_info_[rid].referenced_in_token_tag_dispatch = true;
         }
         continue;
       }
+
       XGRAMMAR_DCHECK(grammar_expr.type == GrammarExprType::kChoices);
       for (auto sequence_id : grammar_expr) {
         auto sequence_expr = base_grammar_->GetGrammarExpr(sequence_id);
-        if (sequence_expr.type != GrammarExprType::kSequence) {
+        if (sequence_expr.type != GrammarExprType::kSequence || sequence_expr.size() == 0) {
           continue;
         }
+
         auto last_element = base_grammar_->GetGrammarExpr(sequence_expr.end()[-1]);
-        if (last_element.type == GrammarExprType::kRuleRef && last_element[0] == rule_id &&
-            i != rule_id) {
-          return false;
+        if (last_element.type == GrammarExprType::kRuleRef && last_element[0] != i) {
+          rule_usage_info_[last_element[0]].referenced_as_last_in_other_rule = true;
         }
 
         for (int j = 0; j < sequence_expr.size() - 1; ++j) {
           auto element_expr = base_grammar_->GetGrammarExpr(sequence_expr[j]);
-          if (element_expr.type != GrammarExprType::kRuleRef || element_expr[0] != rule_id) {
+          if (element_expr.type != GrammarExprType::kRuleRef) {
             continue;
           }
-          if (found) {
-            return false;
+          auto& usage_info = rule_usage_info_[element_expr[0]];
+          usage_info.non_last_ref_count += 1;
+          if (usage_info.non_last_ref_count == 1) {
+            usage_info.first_non_last_suffix.assign(
+                sequence_expr.begin() + j + 1, sequence_expr.end()
+            );
           }
-          found = true;
         }
       }
     }
-    return found;
+  }
+
+  bool CanUseLookaheadAssertion(int32_t rule_id) const {
+    const auto& usage_info = rule_usage_info_[rule_id];
+    return !usage_info.referenced_in_tag_dispatch &&
+           !usage_info.referenced_in_token_tag_dispatch &&
+           !usage_info.referenced_as_last_in_other_rule && usage_info.non_last_ref_count == 1;
+  }
+
+  bool IsExactLookaheadAssertion(int32_t rule_id) {
+    XGRAMMAR_DCHECK(base_grammar_->GetRule(rule_id).lookahead_assertion_id != -1);
+    return CanUseLookaheadAssertion(rule_id);
   }
 
   int32_t DetectLookaheadAssertion(int32_t rule_id) {
-    std::vector<int32_t> found_sequence;  // Element ids
-    bool found = false;
-    for (int i = 0; i < static_cast<int>(base_grammar_->NumRules()); ++i) {
-      auto rule = base_grammar_->GetRule(i);
-      auto grammar_expr = base_grammar_->GetGrammarExpr(rule.body_expr_id);
-      if (grammar_expr.type == GrammarExprType::kTagDispatch) {
-        auto tag_dispatch = base_grammar_->GetTagDispatch(grammar_expr);
-        for (const auto& [trigger, rid] : tag_dispatch.tag_rule_pairs) {
-          if (rid == rule_id) {
-            return -1;
-          }
-        }
-        continue;
-      }
-      if (grammar_expr.type == GrammarExprType::kTokenTagDispatch) {
-        auto ttd = base_grammar_->GetTokenTagDispatch(grammar_expr);
-        for (const auto& [token_id, rid] : ttd.trigger_rule_pairs) {
-          if (rid == rule_id) {
-            return -1;
-          }
-        }
-        continue;
-      }
-      XGRAMMAR_DCHECK(grammar_expr.type == GrammarExprType::kChoices);
-      for (auto sequence_id : grammar_expr) {
-        auto sequence_expr = base_grammar_->GetGrammarExpr(sequence_id);
-        if (sequence_expr.type != GrammarExprType::kSequence) {
-          continue;
-        }
-        auto last_element = base_grammar_->GetGrammarExpr(sequence_expr.end()[-1]);
-        if (last_element.type == GrammarExprType::kRuleRef && last_element[0] == rule_id &&
-            i != rule_id) {
-          return -1;
-        }
-
-        for (int j = 0; j < sequence_expr.size() - 1; ++j) {
-          auto element_expr = base_grammar_->GetGrammarExpr(sequence_expr[j]);
-          if (element_expr.type != GrammarExprType::kRuleRef || element_expr[0] != rule_id) {
-            continue;
-          }
-          if (found) {
-            return -1;
-          }
-          found = true;
-          for (int k = j + 1; k < sequence_expr.size(); ++k) {
-            found_sequence.push_back(sequence_expr[k]);
-          }
-        }
-      }
-    }
-
-    if (!found) {
+    if (!CanUseLookaheadAssertion(rule_id)) {
       return -1;
     }
-    return builder_->AddSequence(found_sequence);
+    return builder_->AddSequence(rule_usage_info_[rule_id].first_non_last_suffix);
   }
 };
 

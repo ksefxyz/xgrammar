@@ -195,6 +195,9 @@ class SchemaParser {
   Result<SchemaSpecPtr, SchemaError> ParseConditional(
       const picojson::object& schema, const std::string& rule_name_hint
   );
+  Result<std::optional<SchemaSpecPtr>, SchemaError> TryParseConditionalDiscriminatorFamilyAsAnyOf(
+      const picojson::object& schema, const std::string& rule_name_hint
+  );
   bool IsPartialObjectFragment(const picojson::object& schema) const;
   picojson::value NormalizePartialObjectFragment(const picojson::value& fragment_value) const;
   Result<SchemaSpecPtr, SchemaError> ParseOneOf(
@@ -284,6 +287,497 @@ picojson::value SchemaParser::NormalizePartialObjectFragment(const picojson::val
   }
 
   return picojson::value(fragment_obj);
+}
+
+Result<std::optional<SchemaSpecPtr>, SchemaError>
+SchemaParser::TryParseConditionalDiscriminatorFamilyAsAnyOf(
+    const picojson::object& schema, const std::string& rule_name_hint
+) {
+  if (!schema.count("allOf") || !schema.at("allOf").is<picojson::array>()) {
+    return ResultOk(std::nullopt);
+  }
+
+  picojson::object base_schema = schema;
+  base_schema.erase("allOf");
+  if (base_schema.empty() || !base_schema.count("properties") ||
+      !base_schema.at("properties").is<picojson::object>()) {
+    return ResultOk(std::nullopt);
+  }
+
+  const auto& all_of = schema.at("allOf").get<picojson::array>();
+  if (all_of.empty()) {
+    return ResultOk(std::nullopt);
+  }
+
+  const auto& base_properties = base_schema.at("properties").get<picojson::object>();
+
+  auto make_required_array = [](const std::vector<std::string>& names) {
+    picojson::array required;
+    for (const auto& name : names) {
+      required.push_back(picojson::value(name));
+    }
+    return required;
+  };
+
+  auto collect_finite_domain =
+      [](const picojson::value& value) -> std::optional<std::vector<picojson::value>> {
+    if (!value.is<picojson::object>()) {
+      return std::nullopt;
+    }
+    const auto& obj = value.get<picojson::object>();
+    std::vector<picojson::value> values;
+    std::unordered_set<std::string> seen;
+    if (obj.count("const")) {
+      values.push_back(obj.at("const"));
+      return values;
+    }
+    if (!obj.count("enum") || !obj.at("enum").is<picojson::array>()) {
+      return std::nullopt;
+    }
+    for (const auto& item : obj.at("enum").get<picojson::array>()) {
+      auto serialized = item.serialize(false);
+      if (seen.insert(serialized).second) {
+        values.push_back(item);
+      }
+    }
+    return values;
+  };
+
+  static const std::unordered_set<std::string> kIgnoredKeys = {
+      "title",
+      "default",
+      "description",
+      "examples",
+      "deprecated",
+      "readOnly",
+      "writeOnly",
+      "$comment",
+  };
+
+  std::function<Result<bool, SchemaError>(
+      const picojson::value&, std::vector<std::vector<std::string>>*)>
+      parse_not_groups =
+          [&](const picojson::value& not_value,
+              std::vector<std::vector<std::string>>* groups) -> Result<bool, SchemaError> {
+    if (!not_value.is<picojson::object>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, "conditional not must be an object"
+      );
+    }
+    const auto& obj = not_value.get<picojson::object>();
+    if (obj.count("required")) {
+      if (!obj.at("required").is<picojson::array>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "conditional not required must be an array"
+        );
+      }
+      std::vector<std::string> group;
+      for (const auto& item : obj.at("required").get<picojson::array>()) {
+        if (!item.is<std::string>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema,
+              "conditional not required must contain only strings"
+          );
+        }
+        group.push_back(item.get<std::string>());
+      }
+      groups->push_back(std::move(group));
+      return ResultOk(true);
+    }
+    if (!obj.count("anyOf") || !obj.at("anyOf").is<picojson::array>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "conditional not only supports required or anyOf of required groups"
+      );
+    }
+    for (const auto& key : obj.ordered_keys()) {
+      if (key == "anyOf" || key == "type" || kIgnoredKeys.count(key) != 0) {
+        continue;
+      }
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "conditional not only supports required or anyOf of required groups"
+      );
+    }
+    for (const auto& option : obj.at("anyOf").get<picojson::array>()) {
+      auto nested_result = parse_not_groups(option, groups);
+      if (nested_result.IsErr()) return nested_result;
+    }
+    return ResultOk(true);
+  };
+
+  auto apply_object_fragment =
+      [&](picojson::object* branch,
+          const picojson::value& fragment_value,
+          const std::string& context) -> Result<bool, SchemaError> {
+        if (!fragment_value.is<picojson::object>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, context + " must be an object"
+          );
+        }
+        const auto& fragment = fragment_value.get<picojson::object>();
+        if (fragment.count("type")) {
+          if (!fragment.at("type").is<std::string>() ||
+              fragment.at("type").get<std::string>() != "object") {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, context + " type must be object"
+            );
+          }
+        }
+        for (const auto& key : fragment.ordered_keys()) {
+          if (key == "type" || key == "properties" || key == "required" ||
+              key == "dependentRequired" || key == "not" || key == "minProperties" ||
+              key == "maxProperties" || kIgnoredKeys.count(key) != 0) {
+            continue;
+          }
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema,
+              context + " only supports object required, properties, dependentRequired, not, "
+                        "minProperties and maxProperties"
+          );
+        }
+
+        if (fragment.count("properties")) {
+          if (!fragment.at("properties").is<picojson::object>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, context + " properties must be an object"
+            );
+          }
+          picojson::object branch_properties;
+          if (branch->count("properties")) {
+            branch_properties = branch->at("properties").get<picojson::object>();
+          }
+          const auto& fragment_properties = fragment.at("properties").get<picojson::object>();
+          for (const auto& property_name : fragment_properties.ordered_keys()) {
+            picojson::value normalized_fragment_property =
+                NormalizePartialObjectFragment(fragment_properties.at(property_name));
+            if (branch_properties.count(property_name)) {
+              picojson::array all_of = {
+                  branch_properties.at(property_name), normalized_fragment_property};
+              picojson::object merged_property;
+              merged_property["allOf"] = picojson::value(all_of);
+              branch_properties[property_name] = picojson::value(merged_property);
+            } else {
+              branch_properties[property_name] = normalized_fragment_property;
+            }
+          }
+          (*branch)["properties"] = picojson::value(branch_properties);
+        }
+
+        if (fragment.count("required")) {
+          if (!fragment.at("required").is<picojson::array>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, context + " required must be an array"
+            );
+          }
+          std::vector<std::string> names;
+          if (branch->count("required")) {
+            for (const auto& item : branch->at("required").get<picojson::array>()) {
+              names.push_back(item.get<std::string>());
+            }
+          }
+          for (const auto& item : fragment.at("required").get<picojson::array>()) {
+            if (!item.is<std::string>()) {
+              return ResultErr<SchemaError>(
+                  SchemaErrorType::kInvalidSchema,
+                  context + " required must contain only strings"
+              );
+            }
+            const auto& name = item.get<std::string>();
+            if (std::find(names.begin(), names.end(), name) == names.end()) {
+              names.push_back(name);
+            }
+          }
+          (*branch)["required"] = picojson::value(make_required_array(names));
+        }
+
+        if (fragment.count("dependentRequired")) {
+          if (!fragment.at("dependentRequired").is<picojson::object>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema,
+                context + " dependentRequired must be an object"
+            );
+          }
+          picojson::object merged_dependencies;
+          if (branch->count("dependentRequired")) {
+            merged_dependencies = branch->at("dependentRequired").get<picojson::object>();
+          }
+          const auto& fragment_dependencies =
+              fragment.at("dependentRequired").get<picojson::object>();
+          for (const auto& trigger : fragment_dependencies.ordered_keys()) {
+            if (!fragment_dependencies.at(trigger).is<picojson::array>()) {
+              return ResultErr<SchemaError>(
+                  SchemaErrorType::kInvalidSchema,
+                  context + " dependentRequired values must be arrays"
+              );
+            }
+            std::vector<std::string> deps;
+            if (merged_dependencies.count(trigger)) {
+              for (const auto& item : merged_dependencies.at(trigger).get<picojson::array>()) {
+                deps.push_back(item.get<std::string>());
+              }
+            }
+            for (const auto& item : fragment_dependencies.at(trigger).get<picojson::array>()) {
+              if (!item.is<std::string>()) {
+                return ResultErr<SchemaError>(
+                    SchemaErrorType::kInvalidSchema,
+                    context + " dependentRequired arrays must contain only strings"
+                );
+              }
+              const auto& dep = item.get<std::string>();
+              if (std::find(deps.begin(), deps.end(), dep) == deps.end()) {
+                deps.push_back(dep);
+              }
+            }
+            merged_dependencies[trigger] = picojson::value(make_required_array(deps));
+          }
+          (*branch)["dependentRequired"] = picojson::value(merged_dependencies);
+        }
+
+        if (fragment.count("minProperties")) {
+          int64_t value = fragment.at("minProperties").get<int64_t>();
+          if (branch->count("minProperties")) {
+            value = std::max(value, branch->at("minProperties").get<int64_t>());
+          }
+          (*branch)["minProperties"] = picojson::value(value);
+        }
+        if (fragment.count("maxProperties")) {
+          int64_t value = fragment.at("maxProperties").get<int64_t>();
+          if (branch->count("maxProperties")) {
+            value = std::min(value, branch->at("maxProperties").get<int64_t>());
+          }
+          (*branch)["maxProperties"] = picojson::value(value);
+        }
+
+        if (fragment.count("not")) {
+          std::vector<std::vector<std::string>> groups;
+          if (branch->count("not")) {
+            auto existing_result = parse_not_groups(branch->at("not"), &groups);
+            if (existing_result.IsErr()) return existing_result;
+          }
+          auto fragment_result = parse_not_groups(fragment.at("not"), &groups);
+          if (fragment_result.IsErr()) return fragment_result;
+          if (groups.size() == 1) {
+            picojson::object not_obj;
+            not_obj["required"] = picojson::value(make_required_array(groups[0]));
+            (*branch)["not"] = picojson::value(not_obj);
+          } else if (!groups.empty()) {
+            picojson::array any_of;
+            for (const auto& group : groups) {
+              picojson::object required_obj;
+              required_obj["required"] = picojson::value(make_required_array(group));
+              any_of.push_back(picojson::value(required_obj));
+            }
+            picojson::object not_obj;
+            not_obj["anyOf"] = picojson::value(any_of);
+            (*branch)["not"] = picojson::value(not_obj);
+          }
+        }
+
+        return ResultOk(true);
+          };
+
+  std::function<Result<std::vector<picojson::value>, SchemaError>(
+      const picojson::value&, const std::string&)>
+      expand_object_fragment_alternatives =
+          [&](const picojson::value& fragment_value,
+              const std::string& context) -> Result<std::vector<picojson::value>, SchemaError> {
+        if (!fragment_value.is<picojson::object>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, context + " must be an object"
+          );
+        }
+        const auto& fragment = fragment_value.get<picojson::object>();
+        if (!fragment.count("anyOf")) {
+          return ResultOk(std::vector<picojson::value>{fragment_value});
+        }
+        if (!fragment.at("anyOf").is<picojson::array>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, context + " anyOf must be an array"
+          );
+        }
+
+        picojson::object shared_fragment = fragment;
+        shared_fragment.erase("anyOf");
+
+        std::vector<picojson::value> expanded_options;
+        const auto& any_of = fragment.at("anyOf").get<picojson::array>();
+        for (size_t idx = 0; idx < any_of.size(); ++idx) {
+          auto nested_result = expand_object_fragment_alternatives(
+              any_of[idx], context + " anyOf[" + std::to_string(idx) + "]"
+          );
+          if (nested_result.IsErr()) return ResultErr(std::move(nested_result).UnwrapErr());
+          for (const auto& nested_fragment : std::move(nested_result).Unwrap()) {
+            picojson::object merged_fragment;
+            auto shared_apply_result = apply_object_fragment(
+                &merged_fragment, picojson::value(shared_fragment), context
+            );
+            if (shared_apply_result.IsErr()) {
+              return ResultErr(std::move(shared_apply_result).UnwrapErr());
+            }
+            auto option_apply_result = apply_object_fragment(
+                &merged_fragment, nested_fragment, context + " anyOf"
+            );
+            if (option_apply_result.IsErr()) {
+              return ResultErr(std::move(option_apply_result).UnwrapErr());
+            }
+            expanded_options.push_back(picojson::value(merged_fragment));
+          }
+        }
+
+        return ResultOk(std::move(expanded_options));
+      };
+
+  std::string discriminator_name;
+  std::vector<picojson::value> discriminator_domain_values;
+  std::unordered_map<std::string, picojson::value> domain_by_serialized_value;
+  std::unordered_map<std::string, std::vector<picojson::value>> alternatives_by_serialized_value;
+
+  for (const auto& sub_schema : all_of) {
+    if (!sub_schema.is<picojson::object>()) {
+      return ResultOk(std::nullopt);
+    }
+    const auto& sub_schema_obj = sub_schema.get<picojson::object>();
+    if (!sub_schema_obj.count("if") || sub_schema_obj.count("else")) {
+      return ResultOk(std::nullopt);
+    }
+    for (const auto& key : sub_schema_obj.ordered_keys()) {
+      if (key == "if" || key == "then" || kIgnoredKeys.count(key) != 0) {
+        continue;
+      }
+      return ResultOk(std::nullopt);
+    }
+
+    if (!sub_schema_obj.at("if").is<picojson::object>()) {
+      return ResultOk(std::nullopt);
+    }
+    const auto& if_obj = sub_schema_obj.at("if").get<picojson::object>();
+    for (const auto& key : if_obj.ordered_keys()) {
+      if (key == "type" || key == "properties" || key == "required" || kIgnoredKeys.count(key) != 0) {
+        continue;
+      }
+      return ResultOk(std::nullopt);
+    }
+    if (if_obj.count("type")) {
+      if (!if_obj.at("type").is<std::string>() || if_obj.at("type").get<std::string>() != "object") {
+        return ResultOk(std::nullopt);
+      }
+    }
+    if (!if_obj.count("properties") || !if_obj.at("properties").is<picojson::object>()) {
+      return ResultOk(std::nullopt);
+    }
+    const auto& conditional_properties = if_obj.at("properties").get<picojson::object>();
+    if (conditional_properties.size() != 1 || !if_obj.count("required") ||
+        !if_obj.at("required").is<picojson::array>()) {
+      return ResultOk(std::nullopt);
+    }
+
+    std::string property_name = conditional_properties.ordered_keys()[0];
+    if (discriminator_name.empty()) {
+      discriminator_name = property_name;
+      if (!base_properties.count(discriminator_name)) {
+        return ResultOk(std::nullopt);
+      }
+      auto base_domain = collect_finite_domain(base_properties.at(discriminator_name));
+      if (!base_domain.has_value()) {
+        return ResultOk(std::nullopt);
+      }
+      discriminator_domain_values = *base_domain;
+      for (const auto& item : discriminator_domain_values) {
+        domain_by_serialized_value[item.serialize(false)] = item;
+      }
+    } else if (discriminator_name != property_name) {
+      return ResultOk(std::nullopt);
+    }
+
+    const auto& required_arr = if_obj.at("required").get<picojson::array>();
+    if (required_arr.size() != 1 || !required_arr[0].is<std::string>() ||
+        required_arr[0].get<std::string>() != discriminator_name) {
+      return ResultOk(std::nullopt);
+    }
+
+    auto branch_values = collect_finite_domain(conditional_properties.at(discriminator_name));
+    if (!branch_values.has_value()) {
+      return ResultOk(std::nullopt);
+    }
+
+    std::vector<picojson::value> positive_alternatives = {picojson::value(picojson::object{})};
+    if (sub_schema_obj.count("then")) {
+      auto expand_result = expand_object_fragment_alternatives(sub_schema_obj.at("then"), "then");
+      if (expand_result.IsErr()) return ResultErr(std::move(expand_result).UnwrapErr());
+      positive_alternatives = std::move(expand_result).Unwrap();
+    }
+
+    for (const auto& branch_value : *branch_values) {
+      auto serialized = branch_value.serialize(false);
+      if (!domain_by_serialized_value.count(serialized)) {
+        continue;
+      }
+      if (alternatives_by_serialized_value.count(serialized)) {
+        return ResultOk(std::nullopt);
+      }
+      alternatives_by_serialized_value[serialized] = positive_alternatives;
+    }
+  }
+
+  if (discriminator_name.empty() || discriminator_domain_values.empty()) {
+    return ResultOk(std::nullopt);
+  }
+
+  AnyOfSpec family_spec;
+  size_t branch_index = 0;
+  for (const auto& domain_value : discriminator_domain_values) {
+    auto serialized = domain_value.serialize(false);
+    if (!alternatives_by_serialized_value.count(serialized)) {
+      return ResultOk(std::nullopt);
+    }
+
+    picojson::object discriminator_properties;
+    picojson::object discriminator_property_schema;
+    discriminator_property_schema["const"] = domain_value;
+    discriminator_properties[discriminator_name] = picojson::value(discriminator_property_schema);
+
+    picojson::object discriminator_fragment;
+    discriminator_fragment["type"] = picojson::value("object");
+    discriminator_fragment["properties"] = picojson::value(discriminator_properties);
+    discriminator_fragment["required"] = picojson::value(make_required_array({discriminator_name}));
+
+    for (const auto& positive_fragment : alternatives_by_serialized_value.at(serialized)) {
+      picojson::object branch_schema = base_schema;
+      if (!branch_schema.count("type")) {
+        branch_schema["type"] = picojson::value("object");
+      }
+
+      auto discriminator_apply_result = apply_object_fragment(
+          &branch_schema, picojson::value(discriminator_fragment), "if"
+      );
+      if (discriminator_apply_result.IsErr()) {
+        return ResultErr(std::move(discriminator_apply_result).UnwrapErr());
+      }
+      auto positive_apply_result =
+          apply_object_fragment(&branch_schema, positive_fragment, "then");
+      if (positive_apply_result.IsErr()) {
+        return ResultErr(std::move(positive_apply_result).UnwrapErr());
+      }
+
+      auto parse_result =
+          Parse(picojson::value(branch_schema), rule_name_hint + "_family_" + std::to_string(branch_index++));
+      if (parse_result.IsErr()) {
+        return ResultErr(std::move(parse_result).UnwrapErr());
+      }
+      family_spec.options.push_back(std::move(parse_result).Unwrap());
+    }
+  }
+
+  if (family_spec.options.empty()) {
+    return ResultOk(std::nullopt);
+  }
+  if (family_spec.options.size() == 1) {
+    return ResultOk<std::optional<SchemaSpecPtr>>(std::move(family_spec.options[0]));
+  }
+  return ResultOk<std::optional<SchemaSpecPtr>>(
+      SchemaSpec::Make(std::move(family_spec), "", rule_name_hint + "_conditional_family")
+  );
 }
 
 std::string SchemaParser::ComputeCacheKey(const picojson::value& schema) {
@@ -3536,6 +4030,18 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseOneOf(
 }
 
 Result<AllOfSpec, SchemaError> SchemaParser::ParseAllOf(const picojson::object& schema) {
+  auto conditional_family_result =
+      TryParseConditionalDiscriminatorFamilyAsAnyOf(schema, "all_conditional_family");
+  if (conditional_family_result.IsErr()) {
+    return ResultErr(std::move(conditional_family_result).UnwrapErr());
+  }
+  auto conditional_family_spec = std::move(conditional_family_result).Unwrap();
+  if (conditional_family_spec.has_value()) {
+    AllOfSpec spec;
+    spec.schemas = {std::move(*conditional_family_spec)};
+    return ResultOk(std::move(spec));
+  }
+
   AllOfSpec spec;
   std::vector<SchemaSpecPtr> merge_candidates;
 
@@ -4483,6 +4989,11 @@ std::string JSONSchemaConverter::GenerateNumber(
 std::string JSONSchemaConverter::GenerateString(
     const StringSpec& spec, const std::string& rule_name
 ) {
+  auto create_shared_string_rule =
+      [&](const std::string& suffix, const std::string& rule_body) -> std::string {
+    return CreateGeneratedRule(rule_name + suffix, rule_body);
+  };
+
   // Check for format
   if (spec.format.has_value()) {
     const std::string& format = *spec.format;
@@ -4490,14 +5001,14 @@ std::string JSONSchemaConverter::GenerateString(
 
     if (regex_pattern.has_value()) {
       std::string converted_regex = RegexToEBNF(regex_pattern.value(), false);
-      return "\"\\\"\" " + converted_regex + " \"\\\"\"";
+      return create_shared_string_rule("_format", "\"\\\"\" " + converted_regex + " \"\\\"\"");
     }
   }
 
   // Check for pattern
   if (spec.pattern.has_value()) {
     std::string converted_regex = RegexToEBNF(*spec.pattern, false);
-    return "\"\\\"\" " + converted_regex + " \"\\\"\"";
+    return create_shared_string_rule("_pattern", "\"\\\"\" " + converted_regex + " \"\\\"\"");
   }
 
   // Check for length constraints
@@ -4510,7 +5021,9 @@ std::string JSONSchemaConverter::GenerateString(
       repetition =
           "{" + std::to_string(spec.min_length) + "," + std::to_string(spec.max_length) + "}";
     }
-    return "\"\\\"\" " + char_pattern + repetition + " \"\\\"\"";
+    return create_shared_string_rule(
+        "_length", "\"\\\"\" " + char_pattern + repetition + " \"\\\"\""
+    );
   }
 
   // Default string
