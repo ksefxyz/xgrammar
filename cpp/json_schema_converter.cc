@@ -378,7 +378,11 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     if (!base_schema.empty()) {
       parts.push_back(picojson::value(base_schema));
     }
-    parts.push_back(branch_schema);
+    if (branch_schema.is<picojson::object>()) {
+      parts.push_back(NormalizePartialObjectFragment(branch_schema));
+    } else {
+      parts.push_back(branch_schema);
+    }
     return Parse(combine_constraints(parts), rule_name_hint);
   };
 
@@ -963,13 +967,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     return ResultErr(std::move(negative_reasons_result).UnwrapErr());
   }
   std::vector<picojson::value> negative_reasons = std::move(negative_reasons_result).Unwrap();
-
-  if (negative_reasons.empty()) {
-    if (schema.count("then")) {
-      return parse_branch_with_base(schema.at("then"));
-    }
-    return Parse(picojson::value(base_schema), rule_name_hint);
-  }
+  bool condition_implied_by_base = negative_reasons.empty();
 
   auto is_object_like_schema = [](const picojson::object& obj) {
     return obj.count("type") || obj.count("properties") || obj.count("required") ||
@@ -1284,7 +1282,22 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     return ResultOk(picojson::value(branch));
   };
 
-  std::vector<picojson::value> branch_options;
+  std::vector<SchemaSpecPtr> branch_options;
+  size_t branch_index = 0;
+  auto append_branch_option =
+      [&](const picojson::value& branch_schema) -> Result<bool, SchemaError> {
+    auto parse_result =
+        Parse(branch_schema, rule_name_hint + "_branch_" + std::to_string(branch_index++));
+    if (parse_result.IsErr()) {
+      auto err = std::move(parse_result).UnwrapErr();
+      if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+        return ResultOk(false);
+      }
+      return ResultErr<SchemaError>(std::move(err));
+    }
+    branch_options.push_back(std::move(parse_result).Unwrap());
+    return ResultOk(true);
+  };
   {
     std::vector<picojson::value> positive_alternatives = {picojson::value(picojson::object{})};
     if (schema.count("then")) {
@@ -1293,13 +1306,17 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
       positive_alternatives = std::move(expand_result).Unwrap();
     }
     for (const auto& positive_fragment : positive_alternatives) {
-      std::vector<picojson::value> positive_parts = {if_value};
+      std::vector<picojson::value> positive_parts;
+      if (!condition_implied_by_base) {
+        positive_parts.push_back(if_value);
+      }
       if (positive_fragment.is<picojson::object>() && !positive_fragment.get<picojson::object>().empty()) {
         positive_parts.push_back(positive_fragment);
       }
       auto branch_result = make_branch(positive_parts, "then");
       if (branch_result.IsErr()) return ResultErr(std::move(branch_result).UnwrapErr());
-      branch_options.push_back(std::move(branch_result).Unwrap());
+      auto append_result = append_branch_option(std::move(branch_result).Unwrap());
+      if (append_result.IsErr()) return ResultErr(std::move(append_result).UnwrapErr());
     }
   }
   std::vector<picojson::value> else_alternatives = {picojson::value(picojson::object{})};
@@ -1316,13 +1333,23 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
       }
       auto branch_result = make_branch(negative_parts, "else");
       if (branch_result.IsErr()) return ResultErr(std::move(branch_result).UnwrapErr());
-      branch_options.push_back(std::move(branch_result).Unwrap());
+      auto append_result = append_branch_option(std::move(branch_result).Unwrap());
+      if (append_result.IsErr()) return ResultErr(std::move(append_result).UnwrapErr());
     }
   }
 
-  picojson::object conditional_schema;
-  conditional_schema["anyOf"] = picojson::value(branch_options);
-  return Parse(picojson::value(conditional_schema), rule_name_hint);
+  if (branch_options.empty()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kUnsatisfiableSchema,
+        "if/then/else branches have no satisfiable intersection with sibling constraints"
+    );
+  }
+  if (branch_options.size() == 1) {
+    return ResultOk(std::move(branch_options.front()));
+  }
+  AnyOfSpec conditional_spec;
+  conditional_spec.options = std::move(branch_options);
+  return ResultOk(SchemaSpec::Make(std::move(conditional_spec), "", rule_name_hint));
 }
 
 Result<SchemaSpecPtr, SchemaError> SchemaParser::MergeAllOfSchemas(

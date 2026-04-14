@@ -1148,6 +1148,73 @@ def test_if_then_else_presence_condition():
     check_schema_with_instance(schema, {}, is_accepted=False, any_whitespace=False)
 
 
+def test_if_then_impossible_positive_branch_is_pruned():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": ["VAT"], "const": "VAT"},
+            "P_2": {"type": "string"},
+            "FaWiersz": {"type": "string"},
+        },
+        "required": ["kind", "P_2"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"kind": {"const": "UPR"}},
+                    "required": ["kind"],
+                },
+                "then": {"required": ["FaWiersz"]},
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"kind": "VAT", "P_2": "FV/1"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"kind": "VAT", "P_2": "FV/1", "FaWiersz": "wiersz"},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_condition_implied_by_base_uses_partial_object_merge():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": ["VAT"], "const": "VAT"},
+            "P_2": {"type": "string"},
+            "FaWiersz": {"type": "string"},
+        },
+        "required": ["kind", "P_2"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"kind": {"const": "VAT"}},
+                    "required": ["kind"],
+                },
+                "then": {"required": ["FaWiersz"]},
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"kind": "VAT", "P_2": "FV/1", "FaWiersz": "wiersz"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"kind": "VAT", "P_2": "FV/1"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
 def test_if_then_anyof_required_alternatives():
     schema = {
         "type": "object",
