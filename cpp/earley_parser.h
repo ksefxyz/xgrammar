@@ -103,7 +103,9 @@ struct ParserState {
 
   bool operator==(const ParserState& other) const {
     return rule_id == other.rule_id && sequence_id == other.sequence_id &&
-           element_id == other.element_id && sub_element_id == other.sub_element_id;
+           element_id == other.element_id && rule_start_pos == other.rule_start_pos &&
+           sub_element_id == other.sub_element_id && repeat_count == other.repeat_count &&
+           partial_codepoint == other.partial_codepoint;
   }
 
   bool operator<(const ParserState& other) const {
@@ -112,7 +114,8 @@ struct ParserState {
     if (element_id != other.element_id) return element_id < other.element_id;
     if (rule_start_pos != other.rule_start_pos) return rule_start_pos < other.rule_start_pos;
     if (sub_element_id != other.sub_element_id) return sub_element_id < other.sub_element_id;
-    return repeat_count < other.repeat_count;
+    if (repeat_count != other.repeat_count) return repeat_count < other.repeat_count;
+    return partial_codepoint < other.partial_codepoint;
   }
 
   friend std::ostream& operator<<(std::ostream& os, const ParserState& state) {
@@ -154,7 +157,27 @@ XGRAMMAR_MEMBER_ARRAY(
 class StateHashForCache {
  public:
   size_t operator()(const ParserState& state) const {
-    return HashCombine(state.rule_id, state.sequence_id, state.element_id, state.sub_element_id);
+    return HashCombine(
+        state.rule_id,
+        state.sequence_id,
+        state.element_id,
+        state.sub_element_id,
+        state.repeat_count,
+        state.partial_codepoint
+    );
+  }
+};
+
+/*!
+ * \brief Equality for adaptive-token-mask cache keys. rule_start_pos is intentionally ignored.
+ */
+class StateEqualForCache {
+ public:
+  bool operator()(const ParserState& lhs, const ParserState& rhs) const {
+    return lhs.rule_id == rhs.rule_id && lhs.sequence_id == rhs.sequence_id &&
+           lhs.element_id == rhs.element_id && lhs.sub_element_id == rhs.sub_element_id &&
+           lhs.repeat_count == rhs.repeat_count &&
+           lhs.partial_codepoint == rhs.partial_codepoint;
   }
 };
 

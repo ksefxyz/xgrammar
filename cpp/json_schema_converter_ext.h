@@ -71,6 +71,7 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
 
   void AddCache(const std::string& key, const std::string& value) override;
   std::optional<std::string> GetCache(const std::string& key) const override;
+  int64_t GetCacheContext() const override;
 
  private:
   // Wrapper strings for XML parameter tags (key prefix/suffix, value prefix, closing suffix)

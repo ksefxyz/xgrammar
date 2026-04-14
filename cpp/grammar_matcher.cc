@@ -36,6 +36,29 @@ int32_t GetBitmaskSize(int vocab_size) { return DynamicBitset::GetBufferSize(voc
 
 DLDataType GetBitmaskDLType() { return DLDataType{kDLInt, 32, 1}; }
 
+template <typename T>
+T* GetTensorDataWithByteOffset(const DLTensor& tensor) {
+  return reinterpret_cast<T*>(reinterpret_cast<char*>(tensor.data) + tensor.byte_offset);
+}
+
+int64_t GetDenseRowStride(const DLTensor& tensor, int64_t row_width, const char* tensor_name) {
+  if (tensor.ndim == 1) {
+    if (tensor.strides != nullptr) {
+      XGRAMMAR_CHECK(tensor.strides[0] == 1)
+          << "The provided " << tensor_name << " must be contiguous on its last dimension";
+    }
+    return row_width;
+  }
+
+  XGRAMMAR_DCHECK(tensor.ndim == 2);
+  if (tensor.strides == nullptr) {
+    return row_width;
+  }
+  XGRAMMAR_CHECK(tensor.strides[1] == 1)
+      << "The provided " << tensor_name << " must be contiguous on its last dimension";
+  return tensor.strides[0];
+}
+
 int32_t* CheckAndGetBitmaskPtr(const DLTensor& token_bitmask, int vocab_size, int index) {
   XGRAMMAR_CHECK(token_bitmask.dtype.code == kDLInt && token_bitmask.dtype.bits == 32)
       << "The provied bitmask's dtype is not valid: should be int32";
@@ -62,7 +85,8 @@ int32_t* CheckAndGetBitmaskPtr(const DLTensor& token_bitmask, int vocab_size, in
       token_bitmask.device.device_type == kDLROCMHost
   ) << "The provided bitmask's device is not valid: should be CPU";
 
-  return reinterpret_cast<int32_t*>(token_bitmask.data) + index * buffer_size;
+  int64_t row_stride = GetDenseRowStride(token_bitmask, buffer_size, "bitmask");
+  return GetTensorDataWithByteOffset<int32_t>(token_bitmask) + index * row_stride;
 }
 
 void _DebugGetMaskedTokensFromBitmask(
@@ -98,22 +122,28 @@ void ApplyMask32Bits(
       logits->ndim == 2
           ? std::make_pair(static_cast<int>(logits->shape[0]), static_cast<int>(logits->shape[1]))
           : std::make_pair(1, static_cast<int>(logits->shape[0]));
-  int logits_stride0 = logits->strides[0];
-  int bitmask_stride0 = bitmask.strides[0];
+  std::pair<int, int> bitmask_shape =
+      bitmask.ndim == 2
+          ? std::make_pair(static_cast<int>(bitmask.shape[0]), static_cast<int>(bitmask.shape[1]))
+          : std::make_pair(1, static_cast<int>(bitmask.shape[0]));
+  int64_t logits_stride0 = GetDenseRowStride(*logits, logits_shape.second, "logits");
+  int64_t bitmask_stride0 = GetDenseRowStride(bitmask, bitmask_shape.second, "bitmask");
+  uint32_t* bitmask_data = GetTensorDataWithByteOffset<uint32_t>(bitmask);
+  float* logits_data = GetTensorDataWithByteOffset<float>(*logits);
   if (indices.has_value()) {
     for (auto idx : indices.value()) {
-      uint32_t* data_ptr = reinterpret_cast<uint32_t*>(bitmask.data) + idx * bitmask_stride0;
+      uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
-      auto logits_ptr = reinterpret_cast<float*>(logits->data) + idx * logits_stride0;
+      auto logits_ptr = logits_data + idx * logits_stride0;
       for (int i = bitset.FindFirstZero(); i != -1; i = bitset.FindNextZero(i)) {
         logits_ptr[i] = -std::numeric_limits<float>::infinity();
       }
     }
   } else {
     for (int idx = 0; idx < logits_shape.first; ++idx) {
-      uint32_t* data_ptr = reinterpret_cast<uint32_t*>(bitmask.data) + idx * bitmask_stride0;
+      uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
-      auto logits_ptr = reinterpret_cast<float*>(logits->data) + idx * logits_stride0;
+      auto logits_ptr = logits_data + idx * logits_stride0;
       for (int i = bitset.FindFirstZero(); i != -1; i = bitset.FindNextZero(i)) {
         logits_ptr[i] = -std::numeric_limits<float>::infinity();
       }
@@ -147,22 +177,28 @@ void ApplyMask16Bits(
       logits->ndim == 2
           ? std::make_pair(static_cast<int>(logits->shape[0]), static_cast<int>(logits->shape[1]))
           : std::make_pair(1, static_cast<int>(logits->shape[0]));
-  int logits_stride0 = logits->strides[0];
-  int bitmask_stride0 = bitmask.strides[0];
+  std::pair<int, int> bitmask_shape =
+      bitmask.ndim == 2
+          ? std::make_pair(static_cast<int>(bitmask.shape[0]), static_cast<int>(bitmask.shape[1]))
+          : std::make_pair(1, static_cast<int>(bitmask.shape[0]));
+  int64_t logits_stride0 = GetDenseRowStride(*logits, logits_shape.second, "logits");
+  int64_t bitmask_stride0 = GetDenseRowStride(bitmask, bitmask_shape.second, "bitmask");
+  uint32_t* bitmask_data = GetTensorDataWithByteOffset<uint32_t>(bitmask);
+  uint16_t* logits_data = GetTensorDataWithByteOffset<uint16_t>(*logits);
   if (indices.has_value()) {
     for (auto idx : indices.value()) {
-      uint32_t* data_ptr = reinterpret_cast<uint32_t*>(bitmask.data) + idx * bitmask_stride0;
+      uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
-      auto logits_ptr = reinterpret_cast<uint16_t*>(logits->data) + idx * logits_stride0;
+      auto logits_ptr = logits_data + idx * logits_stride0;
       for (int i = bitset.FindFirstZero(); i != -1; i = bitset.FindNextZero(i)) {
         logits_ptr[i] = kMinusInfinity;
       }
     }
   } else {
     for (int idx = 0; idx < logits_shape.first; ++idx) {
-      uint32_t* data_ptr = reinterpret_cast<uint32_t*>(bitmask.data) + idx * bitmask_stride0;
+      uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
-      auto logits_ptr = reinterpret_cast<uint16_t*>(logits->data) + idx * logits_stride0;
+      auto logits_ptr = logits_data + idx * logits_stride0;
       for (int i = bitset.FindFirstZero(); i != -1; i = bitset.FindNextZero(i)) {
         logits_ptr[i] = kMinusInfinity;
       }

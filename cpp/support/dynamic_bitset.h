@@ -133,6 +133,7 @@ class DynamicBitset {
   void Set() {
     XGRAMMAR_DCHECK(data_);
     std::memset(data_, 0xFF, buffer_size_ * sizeof(uint32_t));
+    MaskUnusedBits();
   }
 
   /*! \brief Set the bit at the given index to the given value. */
@@ -160,6 +161,7 @@ class DynamicBitset {
     for (int i = 0; i < buffer_size_; ++i) {
       data_[i] |= other.data_[i];
     }
+    MaskUnusedBits();
     return *this;
   }
 
@@ -170,7 +172,7 @@ class DynamicBitset {
     ++pos;
     int blk = pos / BITS_PER_BLOCK;
     int ind = pos % BITS_PER_BLOCK;
-    uint32_t fore = data_[blk] >> ind;
+    uint32_t fore = GetValidBits(blk) >> ind;
     int result = fore ? pos + LowestBit(fore) : DoFindOneFrom(blk + 1);
     return result < size_ ? result : -1;
   }
@@ -182,16 +184,21 @@ class DynamicBitset {
     ++pos;
     int blk = pos / BITS_PER_BLOCK;
     int ind = pos % BITS_PER_BLOCK;
-    uint32_t fore = (~data_[blk]) >> ind;
+    uint32_t fore = (~GetValidBits(blk) & GetBlockMask(blk)) >> ind;
     int result = fore ? pos + LowestBit(fore) : DoFindZeroFrom(blk + 1);
     return result < size_ ? result : -1;
   }
 
   int Count() const {
+    if (size_ == 0) return 0;
     int count = 0;
-    for (int i = 0; i < buffer_size_; ++i) {
+    for (int i = 0; i < buffer_size_ - 1; ++i) {
       count += PopCount(data_[i]);
     }
+    int remaining_bits = size_ % BITS_PER_BLOCK;
+    uint32_t last_block_mask = remaining_bits ? (static_cast<uint32_t>(1) << remaining_bits) - 1
+                                              : ~static_cast<uint32_t>(0);
+    count += PopCount(data_[buffer_size_ - 1] & last_block_mask);
     return count;
   }
 
@@ -223,7 +230,7 @@ class DynamicBitset {
     result.emplace_back(picojson::value(static_cast<int64_t>(bitset.size_)));
     result.emplace_back(picojson::value(static_cast<int64_t>(bitset.buffer_size_)));
     for (int i = 0; i < bitset.buffer_size_; ++i) {
-      result.emplace_back(picojson::value(static_cast<int64_t>(bitset.data_[i])));
+      result.emplace_back(picojson::value(static_cast<int64_t>(bitset.GetValidBits(i))));
     }
     return picojson::value(std::move(result));
   }
@@ -274,12 +281,31 @@ class DynamicBitset {
     if (size_ != other.size_) return false;
     if (buffer_size_ != other.buffer_size_) return false;
     for (int i = 0; i < buffer_size_; ++i) {
-      if (data_[i] != other.data_[i]) return false;
+      if (GetValidBits(i) != other.GetValidBits(i)) return false;
     }
     return true;
   }
 
  private:
+  uint32_t GetBlockMask(int block_index) const {
+    if (size_ == 0 || block_index < 0 || block_index >= buffer_size_) {
+      return 0;
+    }
+    if (block_index != buffer_size_ - 1) {
+      return ~static_cast<uint32_t>(0);
+    }
+    int remaining_bits = size_ % BITS_PER_BLOCK;
+    return remaining_bits ? (static_cast<uint32_t>(1) << remaining_bits) - 1
+                          : ~static_cast<uint32_t>(0);
+  }
+
+  uint32_t GetValidBits(int block_index) const { return data_[block_index] & GetBlockMask(block_index); }
+
+  void MaskUnusedBits() {
+    if (size_ == 0 || buffer_size_ == 0) return;
+    data_[buffer_size_ - 1] &= GetBlockMask(buffer_size_ - 1);
+  }
+
   static int LowestBit(uint32_t value) {
 #ifdef __GNUC__
     return __builtin_ctz(value);
@@ -305,25 +331,25 @@ class DynamicBitset {
   int DoFindZeroFrom(int first_block) const {
     int position = -1;
     for (int i = first_block; i < buffer_size_; ++i) {
-      if (data_[i] != ~static_cast<uint32_t>(0)) {
+      if (GetValidBits(i) != GetBlockMask(i)) {
         position = i;
         break;
       }
     }
     if (position == -1) return -1;
-    return position * BITS_PER_BLOCK + LowestBit(~data_[position]);
+    return position * BITS_PER_BLOCK + LowestBit(~GetValidBits(position) & GetBlockMask(position));
   }
 
   int DoFindOneFrom(int first_block) const {
     int position = -1;
     for (int i = first_block; i < buffer_size_; ++i) {
-      if (data_[i] != 0) {
+      if (GetValidBits(i) != 0) {
         position = i;
         break;
       }
     }
     if (position == -1) return -1;
-    return position * BITS_PER_BLOCK + LowestBit(data_[position]);
+    return position * BITS_PER_BLOCK + LowestBit(GetValidBits(position));
   }
 
   // The size of the bitset.

@@ -102,11 +102,9 @@ def test_basic():
     ebnf_grammar = basic_json_rules_ebnf_no_space + (
         r"""root_prop_3 ::= (("[" "" basic_any (", " basic_any)* "" "]") | ("[" "" "]"))
 root_prop_4 ::= (("[" "" basic_string (", " basic_string)* "" "]") | ("[" "" "]"))
-root_prop_5_item_2 ::= (("[" "" basic_string (", " basic_string)* "" "]") | ("[" "" "]"))
-root_prop_5 ::= ("[" "" (basic_string ", " basic_integer ", " root_prop_5_item_2) "" "]")
+root_prop_5 ::= ("[" "" (basic_string ", " basic_integer ", " root_prop_4) "" "]")
 root_prop_6 ::= ("{" "" basic_string ": " basic_integer (", " basic_string ": " basic_integer)* "" "}") | "{" "}"
-root_prop_7_addl ::= ("{" "" basic_string ": " basic_integer (", " basic_string ": " basic_integer)* "" "}") | "{" "}"
-root_prop_7 ::= ("{" "" basic_string ": " root_prop_7_addl (", " basic_string ": " root_prop_7_addl)* "" "}") | "{" "}"
+root_prop_7 ::= ("{" "" basic_string ": " root_prop_6 (", " basic_string ": " root_prop_6)* "" "}") | "{" "}"
 root_part_6 ::= ", " "\"nested_object_field\"" ": " root_prop_7 ""
 root_part_5 ::= ", " "\"object_field\"" ": " root_prop_6 root_part_6
 root_part_4 ::= ", " "\"tuple_field\"" ": " root_prop_5 root_part_5
@@ -141,10 +139,13 @@ def test_indent():
         object_field: Dict[str, int]
 
     ebnf_grammar = basic_json_rules_ebnf_no_space + (
-        r"""root_prop_0 ::= (("[" "\n    " basic_string (",\n    " basic_string)* "\n  " "]") | ("[" "" "]"))
-root_prop_1_item_2 ::= (("[" "\n      " basic_string (",\n      " basic_string)* "\n    " "]") | ("[" "" "]"))
-root_prop_1 ::= ("[" "\n    " (basic_string ",\n    " basic_integer ",\n    " root_prop_1_item_2) "\n  " "]")
-root_prop_2 ::= ("{" "\n    " basic_string ": " basic_integer (",\n    " basic_string ": " basic_integer)* "\n  " "}") | "{" "}"
+        r"""root_prop_0_additional ::= ["] basic_string_sub
+root_prop_0 ::= (("[" "\n    " root_prop_0_additional (",\n    " root_prop_0_additional)* "\n  " "]") | ("[" "" "]"))
+root_prop_1_item_1 ::= ("0" | "-"? [1-9] [0-9]*)
+root_prop_1_item_2_additional ::= ["] basic_string_sub
+root_prop_1_item_2 ::= (("[" "\n      " root_prop_1_item_2_additional (",\n      " root_prop_1_item_2_additional)* "\n    " "]") | ("[" "" "]"))
+root_prop_1 ::= ("[" "\n    " (root_prop_0_additional ",\n    " root_prop_1_item_1 ",\n    " root_prop_1_item_2) "\n  " "]")
+root_prop_2 ::= ("{" "\n    " basic_string ": " root_prop_1_item_1 (",\n    " basic_string ": " root_prop_1_item_1)* "\n  " "}") | "{" "}"
 root_part_1 ::= ",\n  " "\"object_field\"" ": " root_prop_2 ""
 root_part_0 ::= ",\n  " "\"tuple_field\"" ": " root_prop_1 root_part_1
 root ::= "{" "\n  " (("\"array_field\"" ": " root_prop_0 root_part_0)) "\n" "}"
@@ -1022,6 +1023,36 @@ def test_allof_of_independent_oneof_groups_with_branch_properties():
     )
 
 
+def test_allof_base_required_is_preserved_when_merging_into_oneof_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+            "C": {"type": "integer"},
+        },
+        "required": ["A"],
+        "allOf": [
+            {
+                "required": ["B"],
+                "oneOf": [
+                    {"required": ["C"]},
+                    {"not": {"required": ["C"]}},
+                ],
+            }
+        ],
+    }
+
+    check_schema_with_instance(schema, {"A": 1, "B": 2, "C": 3}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1, "B": 2}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"B": 2, "C": 3}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"A": 1, "C": 3}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, {"B": 2}, is_accepted=False, any_whitespace=False)
+
+
 def test_allof_with_anyof_branch():
     schema = {
         "allOf": [
@@ -1033,6 +1064,600 @@ def test_allof_with_anyof_branch():
     check_schema_with_instance(schema, 1, any_whitespace=False)
     check_schema_with_instance(schema, json.dumps("hello"), is_accepted=False, any_whitespace=False)
     check_schema_with_instance(schema, -1, is_accepted=False, any_whitespace=False)
+
+
+def test_if_then_simple_enum_discriminator():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "KOR"]},
+            "FaWiersz": {"type": "string"},
+        },
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "VAT"}},
+                    "required": ["RodzajFaktury"],
+                },
+                "then": {"required": ["FaWiersz"]},
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"RodzajFaktury": "KOR"}, any_whitespace=False)
+
+
+def test_if_then_else_simple_enum_discriminator():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "KOR"]},
+            "FaWiersz": {"type": "string"},
+            "DaneFaKorygowanej": {"type": "string"},
+        },
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "VAT"}},
+                    "required": ["RodzajFaktury"],
+                },
+                "then": {"required": ["FaWiersz"]},
+                "else": {"required": ["DaneFaKorygowanej"]},
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "KOR", "DaneFaKorygowanej": "korekta"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "KOR"}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_if_then_else_presence_condition():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+            "C": {"type": "integer"},
+        },
+        "if": {"required": ["A"]},
+        "then": {"required": ["B"]},
+        "else": {"required": ["C"]},
+    }
+
+    check_schema_with_instance(schema, {"A": 1, "B": 2}, any_whitespace=False)
+    check_schema_with_instance(schema, {"C": 3}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, {}, is_accepted=False, any_whitespace=False)
+
+
+def test_if_then_anyof_required_alternatives():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["UPR", "VAT"]},
+            "P_15": {"type": "number"},
+            "FaWiersz": {"type": "string"},
+        },
+        "if": {
+            "properties": {"RodzajFaktury": {"const": "UPR"}},
+            "required": ["RodzajFaktury"],
+        },
+        "then": {
+            "anyOf": [
+                {"required": ["P_15"]},
+                {"required": ["FaWiersz"]},
+            ]
+        },
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "P_15": 100}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"RodzajFaktury": "VAT"}, any_whitespace=False)
+
+
+def test_if_then_else_anyof_required_alternatives():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["UPR", "VAT"]},
+            "P_15": {"type": "number"},
+            "FaWiersz": {"type": "string"},
+            "Adres": {"type": "string"},
+            "NIP": {"type": "string"},
+        },
+        "if": {
+            "properties": {"RodzajFaktury": {"const": "UPR"}},
+            "required": ["RodzajFaktury"],
+        },
+        "then": {
+            "anyOf": [
+                {"required": ["P_15"]},
+                {"required": ["FaWiersz"]},
+            ]
+        },
+        "else": {
+            "anyOf": [
+                {"required": ["Adres"]},
+                {"required": ["NIP"]},
+            ]
+        },
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "P_15": 100}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "Adres": "ul. Przykładowa 1"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "NIP": "1234567890"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_object_anyof_required_alternatives_with_sibling_constraints():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "P_7": {"type": "string"},
+            "P_8B": {"type": "number"},
+            "P_9A": {"type": "number"},
+            "P_11": {"type": "number"},
+            "P_12": {"type": "string", "enum": ["23"]},
+        },
+        "required": ["P_7", "P_8B", "P_12"],
+        "anyOf": [
+            {"required": ["P_9A"]},
+            {"required": ["P_11"]},
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"P_7": "Usluga", "P_8B": 1, "P_9A": 100, "P_12": "23"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"P_7": "Usluga", "P_8B": 1, "P_11": 100, "P_12": "23"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"P_7": "Usluga", "P_8B": 1, "P_12": "23"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_if_then_nested_object_property_path():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Fa": {
+                "type": "object",
+                "properties": {
+                    "RodzajFaktury": {"enum": ["UPR", "VAT"]},
+                    "P_15": {"type": "number"},
+                },
+                "required": ["RodzajFaktury"],
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Fa": {
+                    "type": "object",
+                    "properties": {"RodzajFaktury": {"const": "UPR"}},
+                    "required": ["RodzajFaktury"],
+                }
+            },
+            "required": ["Fa"],
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "UPR"}, "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "UPR"}},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "VAT"}},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_else_nested_object_property_path():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Fa": {
+                "type": "object",
+                "properties": {
+                    "RodzajFaktury": {"enum": ["UPR", "VAT"]},
+                },
+                "required": ["RodzajFaktury"],
+            },
+            "Podmiot2": {
+                "type": "object",
+                "properties": {
+                    "Adres": {
+                        "type": "object",
+                        "properties": {"AdresL1": {"type": "string"}},
+                        "required": ["AdresL1"],
+                    }
+                },
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Fa": {
+                    "type": "object",
+                    "properties": {"RodzajFaktury": {"const": "UPR"}},
+                    "required": ["RodzajFaktury"],
+                }
+            },
+            "required": ["Fa"],
+        },
+        "then": {"required": ["Marker"]},
+        "else": {
+            "properties": {
+                "Podmiot2": {
+                    "type": "object",
+                    "properties": {
+                        "Adres": {
+                            "type": "object",
+                            "properties": {"AdresL1": {"type": "string"}},
+                            "required": ["AdresL1"],
+                        }
+                    },
+                    "required": ["Adres"],
+                }
+            },
+            "required": ["Podmiot2"],
+        },
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "UPR"}, "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "VAT"}, "Podmiot2": {"Adres": {"AdresL1": "ul. A"}}},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Fa": {"RodzajFaktury": "VAT"}},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_if_then_else_nested_object_property_path_with_base_oneof_object():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "Podmiot2": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "DaneIdentyfikacyjne": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "Nazwa": {"type": "string"},
+                            "NIP": {"type": "string"},
+                            "KodUE": {"type": "string"},
+                            "NrVatUE": {"type": "string"},
+                            "NrID": {"type": "string"},
+                            "BrakID": {"type": "integer", "enum": [1]},
+                        },
+                        "required": ["Nazwa"],
+                        "oneOf": [
+                            {"required": ["NIP"]},
+                            {"required": ["KodUE", "NrVatUE"]},
+                            {"required": ["NrID"]},
+                            {"required": ["BrakID"]},
+                        ],
+                    },
+                    "Adres": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"AdresL1": {"type": "string"}},
+                    },
+                },
+                "required": ["DaneIdentyfikacyjne"],
+            },
+            "Fa": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "RodzajFaktury": {"type": "string", "enum": ["UPR", "VAT"]},
+                },
+                "required": ["RodzajFaktury"],
+            },
+        },
+        "required": ["Podmiot2", "Fa"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {
+                        "Fa": {
+                            "type": "object",
+                            "properties": {"RodzajFaktury": {"const": "UPR"}},
+                            "required": ["RodzajFaktury"],
+                        }
+                    },
+                    "required": ["Fa"],
+                },
+                "else": {
+                    "properties": {
+                        "Podmiot2": {
+                            "type": "object",
+                            "required": ["Adres"],
+                            "properties": {
+                                "Adres": {
+                                    "type": "object",
+                                    "required": ["AdresL1"],
+                                }
+                            },
+                        }
+                    },
+                    "required": ["Podmiot2"],
+                },
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {
+            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "123"}},
+            "Fa": {"RodzajFaktury": "UPR"},
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Podmiot2": {
+                "DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "123"},
+                "Adres": {"AdresL1": "ul. A"},
+            },
+            "Fa": {"RodzajFaktury": "VAT"},
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "123"}},
+            "Fa": {"RodzajFaktury": "VAT"},
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_if_property_predicate_requires_finite_sibling_domain():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"type": "string"},
+            "FaWiersz": {"type": "string"},
+        },
+        "if": {
+            "properties": {"RodzajFaktury": {"const": "VAT"}},
+            "required": ["RodzajFaktury"],
+        },
+        "then": {"required": ["FaWiersz"]},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "direct sibling property definition with const or enum" in str(e.value)
+
+
+def test_if_scalar_property_predicate_is_not_misclassified_as_nested_object():
+    schema = {
+        "type": "object",
+        "properties": {
+            "X": {"type": "integer"},
+            "Y": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "X": {
+                    "type": "integer",
+                    "minimum": 5,
+                }
+            },
+            "required": ["X"],
+        },
+        "then": {"required": ["Y"]},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "if property predicates only support const or enum" in str(e.value)
+
+
+def test_if_then_array_contains_simple_item_discriminator():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "Rola": {"enum": [8, 10]},
+                        "Nazwa": {"type": "string"},
+                    },
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                        "required": ["Rola"],
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}, {"Rola": 10}], "JST": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 10}]},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_else_array_contains_simple_item_discriminator():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+            "GV": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                        "required": ["Rola"],
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+        "else": {"required": ["GV"]},
+    }
+
+    check_schema_with_instance(schema, {"Podmiot3": [{"Rola": 8}], "JST": 1}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 10}], "GV": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(schema, {"Podmiot3": [], "GV": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"GV": 1}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 10}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_if_array_contains_requires_finite_item_domain():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"type": "integer"}},
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                        "required": ["Rola"],
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "direct sibling item property definition with const or enum" in str(e.value)
 
 
 def test_dependent_required_bidirectional_pair():
@@ -1446,6 +2071,23 @@ def test_dynamic_model():
     instance_str = json.dumps(instance.model_dump(mode="json"))
     check_schema_with_instance(
         CompleteModel.model_json_schema(), instance_str, any_whitespace=False
+    )
+
+
+def test_non_whitespace_escape_allows_left_bracket():
+    class MainModel(BaseModel):
+        restricted_string: str = Field(..., pattern=r"\S")
+
+    check_schema_with_instance(
+        MainModel.model_json_schema(),
+        '{"restricted_string": "["}',
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        MainModel.model_json_schema(),
+        '{"restricted_string": " "}',
+        is_accepted=False,
+        any_whitespace=False,
     )
 
 

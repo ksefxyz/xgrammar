@@ -74,6 +74,8 @@ struct ArraySpec {
   std::vector<SchemaSpecPtr> prefix_items;
   bool allow_additional_items = true;
   SchemaSpecPtr additional_items;  // nullptr means not allowed
+  SchemaSpecPtr contains_item;     // nullptr means no contains constraint
+  int64_t min_contains = 0;        // only 0 or 1 supported
   int64_t min_items = 0;
   int64_t max_items = -1;  // -1 means no limit
 
@@ -205,13 +207,13 @@ enum class JSONFormat : int {
 class GenerateCacheManager {
  public:
   /*! \brief Add a key-value pair to the cache. */
-  void AddCache(const std::string& key, bool is_inner_layer, const std::string& value) {
-    cache_[{key, is_inner_layer}] = value;
+  void AddCache(const std::string& key, int64_t context, const std::string& value) {
+    cache_[{key, context}] = value;
   }
 
   /*! \brief Get cached value by key. Returns std::nullopt if not found. */
-  std::optional<std::string> GetCache(const std::string& key, bool is_inner_layer) const {
-    auto it = cache_.find({key, is_inner_layer});
+  std::optional<std::string> GetCache(const std::string& key, int64_t context) const {
+    auto it = cache_.find({key, context});
     if (it != cache_.end()) {
       return it->second;
     }
@@ -219,7 +221,7 @@ class GenerateCacheManager {
   }
 
  private:
-  std::unordered_map<std::pair<std::string, bool>, std::string> cache_;
+  std::unordered_map<std::pair<std::string, int64_t>, std::string> cache_;
 };
 
 /*!
@@ -339,6 +341,9 @@ class JSONSchemaConverter {
 
   /*! \brief Get cached value by key. Returns std::nullopt if not found. */
   virtual std::optional<std::string> GetCache(const std::string& key) const;
+
+  /*! \brief Return the cache context for the current generation position. */
+  virtual int64_t GetCacheContext() const;
 
   // ==================== Helper methods (for subclasses to use) ====================
 

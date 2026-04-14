@@ -522,10 +522,17 @@ std::vector<std::pair<int, int>> RegexIR::HandleEscapes(const std::string& regex
       return std::vector<std::pair<int, int>>(1, std::make_pair('\0', '\0'));
     }
     case 's': {
-      return std::vector<std::pair<int, int>>(1, std::make_pair(0, ' '));
+      std::vector<std::pair<int, int>> result;
+      result.emplace_back('\t', '\r');
+      result.emplace_back(' ', ' ');
+      return result;
     }
     case 'S': {
-      return std::vector<std::pair<int, int>>(1, std::make_pair(' ' + 1, 0x00FF));
+      std::vector<std::pair<int, int>> result;
+      result.emplace_back(0, '\t' - 1);
+      result.emplace_back('\r' + 1, ' ' - 1);
+      result.emplace_back(' ' + 1, 0x00FF);
+      return result;
     }
     case 'd': {
       return std::vector<std::pair<int, int>>(1, std::make_pair('0', '9'));

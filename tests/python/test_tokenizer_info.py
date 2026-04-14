@@ -215,6 +215,16 @@ def test_special_token_detection():
     assert set(tokenizer_info.special_token_ids) == expected_special_tokens
 
 
+def test_byte_fallback_decoder_accepts_lowercase_hex_digits():
+    tokenizer_info = xgr.TokenizerInfo(["<0x1b>", "<0xAf>", "<0xaf>"], xgr.VocabType.BYTE_FALLBACK)
+    assert tokenizer_info.decoded_vocab == [b"\x1b", b"\xaf", b"\xaf"]
+
+
+def test_byte_fallback_decoder_rejects_invalid_hex_digits():
+    with pytest.raises(RuntimeError, match="Invalid hex digit in byte fallback token"):
+        xgr.TokenizerInfo(["<0x1g>"], xgr.VocabType.BYTE_FALLBACK)
+
+
 @pytest.mark.hf_token_required
 @pytest.mark.parametrize(
     "tokenizer_path", ["meta-llama/Llama-2-7b-chat-hf", "meta-llama/Meta-Llama-3-8B-Instruct"]

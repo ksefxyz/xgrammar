@@ -1,11 +1,48 @@
 #include <gtest/gtest.h>
 #include <xgrammar/xgrammar.h>
 
+#include <set>
+#include <unordered_set>
+
+#include "earley_parser.h"
 #include "grammar_parser.h"
 #include "support/encoding.h"
 #include "test_utils.h"
 
 using namespace xgrammar;
+
+TEST(XGrammarParserStateTest, ComparisonAndCacheEqualityAreConsistent) {
+  ParserState base{1, 2, 3, 10, 4, 0, 0};
+  ParserState different_rule_start{1, 2, 3, 20, 4, 0, 0};
+  ParserState different_repeat{1, 2, 3, 10, 4, 1, 0};
+  ParserState different_partial{1, 2, 3, 10, 4, 0, 42};
+
+  EXPECT_EQ(base, base);
+  EXPECT_FALSE(base == different_rule_start);
+  EXPECT_FALSE(base == different_repeat);
+  EXPECT_FALSE(base == different_partial);
+
+  std::set<ParserState> ordered_states{base, different_rule_start, different_repeat, different_partial};
+  EXPECT_EQ(ordered_states.size(), 4U);
+
+  std::unordered_set<ParserState, StateHashForCache, StateEqualForCache> cache_states;
+  cache_states.insert(base);
+  cache_states.insert(different_rule_start);
+  cache_states.insert(different_repeat);
+  cache_states.insert(different_partial);
+  EXPECT_EQ(cache_states.size(), 3U);
+}
+
+TEST(XGrammarUtilsTest, VectorHashWorksAsKeyHasher) {
+  std::unordered_set<std::vector<int>> values;
+  values.insert({1, 2, 3});
+  values.insert({1, 2, 3});
+  values.insert({1, 2, 4});
+
+  EXPECT_EQ(values.size(), 2U);
+  EXPECT_EQ(values.count(std::vector<int>{1, 2, 3}), 1U);
+  EXPECT_EQ(values.count(std::vector<int>{1, 2, 4}), 1U);
+}
 
 // Note: the inputs to the lexer tests may not be valid EBNF
 TEST(XGrammarLexerTest, BasicTokenization) {

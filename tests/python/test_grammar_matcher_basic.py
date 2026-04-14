@@ -15,6 +15,8 @@ from xgrammar.testing import (
     _get_matcher_from_grammar,
     _get_matcher_from_grammar_and_tokenizer_info,
     _is_grammar_accept_string,
+    bitmask_to_bool_mask,
+    bool_mask_to_bitmask,
 )
 
 _is_cuda_available = torch.cuda.is_available()
@@ -174,6 +176,73 @@ def test_token_operations():
     result.append(accepted_tokens)
 
     assert result == expected
+
+
+def test_fill_next_token_bitmask_supports_strided_row_views():
+    vocab = [
+        "<s>",
+        "</s>",
+        "a",
+        "abc",
+        'b"',
+        '"',
+        ':"',
+        "{",
+        "}",
+        ", ",
+        "6",
+        ":",
+        "\n",
+        " ",
+        '"a":true',
+    ]
+    tokenizer_info = xgr.TokenizerInfo(vocab)
+    buffer_size = math.ceil(tokenizer_info.vocab_size / 32)
+
+    expected = xgr.allocate_token_bitmask(2, tokenizer_info.vocab_size)
+    expected_matcher = _get_matcher_from_grammar_and_tokenizer_info(json_grammar, tokenizer_info)
+    expected_matcher.fill_next_token_bitmask(expected, 1)
+
+    sentinel = 0x13579BDF
+    padded = torch.full((2, buffer_size + 3), sentinel, dtype=torch.int32)
+    strided = padded[:, 1 : 1 + buffer_size]
+
+    matcher = _get_matcher_from_grammar_and_tokenizer_info(json_grammar, tokenizer_info)
+    matcher.fill_next_token_bitmask(strided, 1)
+
+    torch.testing.assert_close(strided[1], expected[1])
+    assert torch.all(strided[0] == sentinel)
+    assert torch.all(padded[:, 0] == sentinel)
+    assert torch.all(padded[:, 1 + buffer_size :] == sentinel)
+
+
+def test_apply_token_bitmask_inplace_cpu_supports_strided_views():
+    vocab_size = 40
+    allowed = torch.ones((2, vocab_size), dtype=torch.bool)
+    allowed[0, [1, 5, 9]] = False
+    allowed[1, [0, 7, 31, 39]] = False
+    contiguous_bitmask = bool_mask_to_bitmask(allowed)
+
+    logits_base = torch.arange(2 * (vocab_size + 4), dtype=torch.float32).reshape(2, vocab_size + 4)
+    logits_view = logits_base[:, 2 : 2 + vocab_size]
+    expected_logits = logits_view.clone()
+
+    bitmask_base = torch.full((2, contiguous_bitmask.shape[1] + 3), -1, dtype=torch.int32)
+    bitmask_view = bitmask_base[:, 1 : 1 + contiguous_bitmask.shape[1]]
+    bitmask_view.copy_(contiguous_bitmask)
+
+    xgr.apply_token_bitmask_inplace(
+        expected_logits, contiguous_bitmask, vocab_size=vocab_size, backend="cpu"
+    )
+    xgr.apply_token_bitmask_inplace(
+        logits_view, bitmask_view, vocab_size=vocab_size, backend="cpu"
+    )
+
+    torch.testing.assert_close(logits_view, expected_logits)
+    torch.testing.assert_close(
+        bitmask_to_bool_mask(bitmask_view, vocab_size),
+        bitmask_to_bool_mask(contiguous_bitmask, vocab_size),
+    )
 
 
 def test_rollback():

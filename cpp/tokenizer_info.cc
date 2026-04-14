@@ -46,11 +46,23 @@ class TokenDecoder {
   /*! \brief ByteFallback decoder: transform tokens like <0x1B> to hex char byte 1B */
   static std::string ByteFallbackDecoder(const std::string& token) {
     if (token.length() == 6 && token.substr(0, 3) == "<0x" && token.back() == '>') {
+      auto decode_hex_digit = [&](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+          return ch - '0';
+        }
+        if (ch >= 'A' && ch <= 'F') {
+          return ch - 'A' + 10;
+        }
+        if (ch >= 'a' && ch <= 'f') {
+          return ch - 'a' + 10;
+        }
+        XGRAMMAR_CHECK(false) << "Invalid hex digit in byte fallback token: " << token;
+        return 0;
+      };
       int byte = 0;
       for (int i = 0; i < 2; ++i) {
         byte *= 16;
-        byte += token[3 + i] >= '0' && token[3 + i] <= '9' ? token[3 + i] - '0'
-                                                           : token[3 + i] - 'A' + 10;
+        byte += decode_hex_digit(token[3 + i]);
       }
       XGRAMMAR_CHECK(byte >= 0 && byte < 256);
       return std::string(/*n=*/1, static_cast<char>(byte));

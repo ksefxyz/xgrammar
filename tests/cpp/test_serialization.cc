@@ -502,6 +502,64 @@ TEST(XGrammarSerializationTest, TestDynamicBitset) {
     auto json_value2 = AutoSerializeJSONValue(deserialized);
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
   }
+
+  // Count should ignore padding bits in the last block.
+  {
+    DynamicBitset bitset(10);
+    bitset.Set();
+
+    ASSERT_EQ(bitset.Count(), 10);
+    ASSERT_TRUE(bitset.All());
+  }
+
+  // Count should also ignore padding bits when the bitset spans multiple blocks.
+  {
+    DynamicBitset bitset(33);
+    bitset.Set();
+
+    ASSERT_EQ(bitset.Count(), 33);
+    ASSERT_TRUE(bitset.All());
+  }
+
+  // Finders should ignore padding bits on non-word-aligned bitsets.
+  {
+    DynamicBitset bitset(10);
+    for (int i = 0; i < 10; ++i) {
+      bitset.Set(i);
+    }
+
+    ASSERT_EQ(bitset.FindFirstOne(), 0);
+    ASSERT_EQ(bitset.FindFirstZero(), -1);
+  }
+
+  // OR-ing from a larger same-buffer-size bitset should not contaminate padding bits.
+  {
+    DynamicBitset bitset(10);
+    DynamicBitset other(20);
+    other.Set(15);
+
+    bitset |= other;
+
+    ASSERT_EQ(bitset.Count(), 0);
+    ASSERT_EQ(bitset.FindFirstOne(), -1);
+    ASSERT_EQ(AutoSerializeJSONValue(bitset).serialize(), "[10,1,0]");
+    ASSERT_EQ(bitset, DynamicBitset(10));
+  }
+
+  // Serialization and equality should ignore padding bits.
+  {
+    DynamicBitset clean(10);
+    DynamicBitset padded(10);
+    padded.Set();
+    for (int i = 0; i < 10; ++i) {
+      padded.Reset(i);
+    }
+
+    ASSERT_EQ(clean.Count(), 0);
+    ASSERT_EQ(padded.Count(), 0);
+    ASSERT_EQ(clean, padded);
+    ASSERT_EQ(AutoSerializeJSONValue(padded).serialize(), "[10,1,0]");
+  }
 }
 
 TEST(XGrammarSerializationTest, TestCompactFSM) {
