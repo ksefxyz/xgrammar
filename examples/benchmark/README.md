@@ -1,6 +1,55 @@
 
 ## Run Benchmark
 
+### Benchmark Tokenizer-Aware C++ Compilation
+
+This benchmark is intended for the current runtime artifacts:
+- raw tool schema JSON
+- forced VAT structural wrapper
+- normal runtime structural wrapper
+
+#### Build
+```bash
+/Users/dw/Projects/LLM/experiment/xgrammar/.venv/lib/python3.12/site-packages/cmake/data/bin/cmake \
+  -S . -B build-bench -DXGRAMMAR_BUILD_CXX_BENCHMARKS=ON -DXGRAMMAR_BUILD_PYTHON_BINDINGS=OFF
+
+/Users/dw/Projects/LLM/experiment/xgrammar/.venv/lib/python3.12/site-packages/cmake/data/bin/cmake \
+  --build build-bench --target xgrammar_bench_compiler -j4
+```
+
+#### Run
+Structural tag:
+```bash
+./build-bench/xgrammar_bench_compiler /path/to/model_dir /path/to/structural.json \
+  --kind structural --threads 8 --repeat 3 --warmup 1 --reuse-compiler on
+```
+
+JSON Schema:
+```bash
+./build-bench/xgrammar_bench_compiler /path/to/model_dir /path/to/schema.json \
+  --kind schema --threads 8 --repeat 3 --warmup 1 --reuse-compiler on
+```
+
+EBNF:
+```bash
+./build-bench/xgrammar_bench_compiler /path/to/model_dir /path/to/grammar.ebnf \
+  --kind ebnf --root root --threads 8 --repeat 3 --warmup 1 --reuse-compiler on
+```
+
+Cold-compile measurements:
+```bash
+./build-bench/xgrammar_bench_compiler /path/to/model_dir /path/to/structural.json \
+  --kind structural --threads 8 --repeat 3 --reuse-compiler off
+```
+
+#### Output
+The tool prints:
+- tokenizer metadata load time
+- per-run compile time
+- average compile time
+- compiled grammar retained size
+- compiler cache size after the run
+
 ### Benchmark Grammar Compile and Mask Generation
 
 #### Dependencies

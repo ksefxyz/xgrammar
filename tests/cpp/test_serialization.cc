@@ -145,6 +145,18 @@ TEST(XGrammarSerializationTest, TestSTLAndBuiltinTypes) {
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
   }
 
+  {
+    std::string value("\0A\xff", 3);
+    auto json_value = AutoSerializeJSONValue(value);
+    ASSERT_TRUE(json_value.is<std::string>());
+
+    std::string deserialized;
+    auto error = AutoDeserializeJSONValue(&deserialized, json_value);
+    ASSERT_FALSE(error.has_value());
+    ASSERT_EQ(deserialized.size(), value.size());
+    ASSERT_EQ(deserialized, value);
+  }
+
   // Test containers
   {
     std::vector<int> value = {1, 2, 3};
@@ -592,6 +604,19 @@ TEST(XGrammarSerializationTest, TestDynamicBitset) {
     ASSERT_EQ(clean, padded);
     ASSERT_EQ(AutoSerializeJSONValue(padded).serialize(), "[10,1,0]");
   }
+
+  // Copying a bitset backed by external storage should deep-copy its contents.
+  {
+    uint32_t storage[1] = {0};
+    DynamicBitset external(10, storage);
+    external.Set(3);
+
+    DynamicBitset copied(external);
+    external.Reset(3);
+
+    ASSERT_TRUE(copied[3]);
+    ASSERT_FALSE(external[3]);
+  }
 }
 
 TEST(XGrammarSerializationTest, TestCompactFSM) {
@@ -653,6 +678,22 @@ TEST(XGrammarSerializationTest, TestCompactFSM) {
     // Test roundtrip
     auto json_value2 = AutoSerializeJSONValue(deserialized);
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
+  }
+
+  // Repeat edge rule ids should preserve full int32_t range.
+  {
+    FSM fsm(2);
+    fsm.AddRepeatEdge(0, 1, 40000, 2, 5);
+
+    CompactFSM compact_fsm = fsm.ToCompact();
+    ASSERT_EQ(compact_fsm.GetEdges(0).size(), 1U);
+    const auto& edge = compact_fsm.GetEdges(0)[0];
+    ASSERT_TRUE(edge.IsRepeatRef());
+
+    auto repeat_info = compact_fsm.GetRepeatEdgeInfo(edge.GetAuxIndex());
+    ASSERT_EQ(repeat_info.RuleId(), 40000);
+    ASSERT_EQ(repeat_info.Lower(), 2);
+    ASSERT_EQ(repeat_info.Upper(), 5);
   }
 }
 

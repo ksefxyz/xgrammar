@@ -1093,6 +1093,33 @@ def test_if_then_simple_enum_discriminator():
     check_schema_with_instance(schema, {"RodzajFaktury": "KOR"}, any_whitespace=False)
 
 
+def test_if_then_simple_enum_discriminator_uses_base_required():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "KOR"]},
+            "FaWiersz": {"type": "string"},
+        },
+        "required": ["RodzajFaktury"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "VAT"}},
+                },
+                "then": {"required": ["FaWiersz"]},
+            }
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"RodzajFaktury": "KOR"}, any_whitespace=False)
+
+
 def test_if_then_else_simple_enum_discriminator():
     schema = {
         "type": "object",
@@ -1126,6 +1153,61 @@ def test_if_then_else_simple_enum_discriminator():
     )
     check_schema_with_instance(
         schema, {"RodzajFaktury": "KOR"}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_if_then_discriminator_family_uses_base_required():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR", "ZAL"]},
+            "FaWiersz": {"type": "string"},
+            "P_15": {"type": "number"},
+            "Zamowienie": {"type": "string"},
+        },
+        "required": ["RodzajFaktury"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "VAT"}},
+                },
+                "then": {"required": ["FaWiersz"]},
+            },
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "UPR"}},
+                },
+                "then": {
+                    "anyOf": [
+                        {"required": ["P_15"]},
+                        {"required": ["FaWiersz"]},
+                    ]
+                },
+            },
+            {
+                "if": {
+                    "properties": {"RodzajFaktury": {"const": "ZAL"}},
+                },
+                "then": {"required": ["P_15", "Zamowienie"]},
+            },
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "P_15": 100}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "FaWiersz": "wiersz"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "ZAL", "P_15": 100, "Zamowienie": "zam"}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
     )
 
 
@@ -1245,6 +1327,66 @@ def test_if_then_anyof_required_alternatives():
         schema, {"RodzajFaktury": "UPR"}, is_accepted=False, any_whitespace=False
     )
     check_schema_with_instance(schema, {"RodzajFaktury": "VAT"}, any_whitespace=False)
+
+
+def test_if_then_false_forbids_condition_match():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+        },
+        "if": {"required": ["A"]},
+        "then": False,
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+
+
+def test_if_then_required_only_condition_requires_dependent_field():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+        },
+        "if": {"required": ["A"]},
+        "then": {"required": ["B"]},
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"B": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1, "B": 2}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+
+
+def test_if_then_allof_object_fragments():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Kind": {"enum": ["A", "B"]},
+            "X": {"type": "integer"},
+            "Y": {"type": "integer"},
+        },
+        "if": {
+            "properties": {"Kind": {"const": "A"}},
+            "required": ["Kind"],
+        },
+        "then": {
+            "allOf": [
+                {"required": ["X"]},
+                {"required": ["Y"]},
+            ]
+        },
+    }
+
+    check_schema_with_instance(
+        schema, {"Kind": "A", "X": 1, "Y": 2}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Kind": "A", "X": 1}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"Kind": "B"}, any_whitespace=False)
 
 
 def test_allof_discriminator_family_is_compacted_without_losing_semantics():
@@ -1719,6 +1861,56 @@ def test_if_then_array_contains_simple_item_discriminator():
     )
 
 
+def test_if_then_array_contains_uses_base_item_required():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "Rola": {"enum": [8, 10]},
+                        "Nazwa": {"type": "string"},
+                    },
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}, {"Rola": 10}], "JST": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 10}]},
+        any_whitespace=False,
+    )
+
+
 def test_if_then_else_array_contains_simple_item_discriminator():
     schema = {
         "type": "object",
@@ -1800,6 +1992,145 @@ def test_if_array_contains_requires_finite_item_domain():
     with pytest.raises(Exception) as e:
         xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
     assert "direct sibling item property definition with const or enum" in str(e.value)
+
+
+def test_dependent_schemas_required_fragment():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+        },
+        "dependentSchemas": {
+            "A": {"required": ["B"]},
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"B": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1, "B": 2}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+
+
+def test_dependent_schemas_nested_object_fragment():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Trigger": {"type": "integer"},
+            "Buyer": {
+                "type": "object",
+                "properties": {
+                    "Adres": {
+                        "type": "object",
+                        "properties": {
+                            "AdresL1": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+        "dependentSchemas": {
+            "Trigger": {
+                "properties": {
+                    "Buyer": {
+                        "required": ["Adres"],
+                        "properties": {
+                            "Adres": {
+                                "required": ["AdresL1"],
+                            }
+                        },
+                    }
+                },
+                "required": ["Buyer"],
+            }
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"Buyer": {"Adres": {}}},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Trigger": 1, "Buyer": {"Adres": {"AdresL1": "x"}}},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Trigger": 1},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Trigger": 1, "Buyer": {"Adres": {}}},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_dependent_schemas_false_branch_forbids_trigger():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+        },
+        "dependentSchemas": {
+            "A": False,
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+
+
+def test_dependent_schemas_allof_object_fragments():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Trigger": {"type": "integer"},
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+        },
+        "dependentSchemas": {
+            "Trigger": {
+                "allOf": [
+                    {"required": ["A"]},
+                    {"required": ["B"]},
+                ]
+            }
+        },
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"Trigger": 1, "A": 1, "B": 2}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Trigger": 1, "A": 1}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_dependent_schemas_rejects_unsupported_conditional_subschema():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+        },
+        "dependentSchemas": {
+            "A": {
+                "if": {"required": ["B"]},
+                "then": {"required": ["A"]},
+            }
+        },
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "dependentSchemas property A only supports object fragments" in str(e.value)
 
 
 def test_dependent_required_bidirectional_pair():

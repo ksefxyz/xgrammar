@@ -141,6 +141,21 @@ def test_whitespace_escapes(regex_string: str, instance: str, is_accepted: bool)
     assert _is_grammar_accept_string(grammar, instance) == is_accepted
 
 
+@pytest.mark.parametrize(
+    "instance, is_accepted",
+    [
+        ("axb", True),
+        ("a\nb", False),
+        ("a\rb", False),
+        ("a\u2028b", False),
+        ("a\u2029b", False),
+    ],
+)
+def test_dot_excludes_line_terminators(instance: str, is_accepted: bool):
+    grammar = xgr.Grammar.from_regex(r"a.b")
+    assert _is_grammar_accept_string(grammar, instance) == is_accepted
+
+
 regex_input_str_test_fill_next_token_bitmask = [
     (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}", "test@email.com"),
     (r"[0-9]{3}-[0-9]{3}-[0-9]{4}", "123-456-7890"),

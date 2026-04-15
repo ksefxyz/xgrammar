@@ -4,7 +4,12 @@
 #include <set>
 #include <unordered_set>
 
+#define private public
+#define protected public
 #include "earley_parser.h"
+#undef protected
+#undef private
+#include "grammar_functor.h"
 #include "grammar_parser.h"
 #include "support/encoding.h"
 #include "test_utils.h"
@@ -42,6 +47,44 @@ TEST(XGrammarUtilsTest, VectorHashWorksAsKeyHasher) {
   EXPECT_EQ(values.size(), 2U);
   EXPECT_EQ(values.count(std::vector<int>{1, 2, 3}), 1U);
   EXPECT_EQ(values.count(std::vector<int>{1, 2, 4}), 1U);
+}
+
+TEST(XGrammarParserStateTest, DebugPrintOnSequencePredictionDoesNotReadInvalidRuleId) {
+  auto grammar = GrammarOptimizer::Apply(Grammar::FromEBNF(R"(
+    root ::= child
+    child ::= "a" child | "b"
+  )"));
+
+  int32_t sequence_id = -1;
+  int32_t element_id = -1;
+  for (int32_t i = 0; i < grammar->NumGrammarExprs(); ++i) {
+    const auto expr = grammar->GetGrammarExpr(i);
+    if (expr.type != Grammar::Impl::GrammarExprType::kSequence) {
+      continue;
+    }
+    for (int32_t j = 0; j < expr.size(); ++j) {
+      const auto child_expr = grammar->GetGrammarExpr(expr[j]);
+      if (child_expr.type == Grammar::Impl::GrammarExprType::kRuleRef) {
+        sequence_id = i;
+        element_id = j;
+        break;
+      }
+    }
+    if (sequence_id != -1) {
+      break;
+    }
+  }
+
+  ASSERT_NE(sequence_id, -1);
+  ASSERT_NE(element_id, -1);
+
+  ParserState state{-1, sequence_id, element_id, ParserState::kNoPrevInputPos, 0};
+  EarleyParser parser(grammar, ParserState::GetInvalidState(), false);
+
+  EXPECT_NO_THROW({
+    auto predict_result = parser.Predict(state, true);
+    (void)predict_result;
+  });
 }
 
 // Note: the inputs to the lexer tests may not be valid EBNF

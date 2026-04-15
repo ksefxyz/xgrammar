@@ -275,7 +275,17 @@ void RegexConverter::HandleGroupModifier() {
     RaiseError("Lookbehind is not supported yet.");
   } else if (*current_ == '<') {
     ++current_;
-    while (current_ != end_ && isalpha(*current_)) {
+    auto is_name_start = [](TCodepoint ch) {
+      return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '$';
+    };
+    auto is_name_continue = [&](TCodepoint ch) {
+      return is_name_start(ch) || (ch >= '0' && ch <= '9');
+    };
+    if (current_ == end_ || !is_name_start(*current_)) {
+      RaiseError("Invalid named capturing group.");
+    }
+    ++current_;
+    while (current_ != end_ && is_name_continue(*current_)) {
       ++current_;
     }
     if (current_ == end_ || *current_ != '>') {
@@ -364,9 +374,9 @@ std::string RegexConverter::Convert() {
     } else if (*current_ == '\\') {
       is_empty = false;
       AddEBNFSegment(HandleEscape());
-    } else if (*current_ == '.') {
+  } else if (*current_ == '.') {
       is_empty = false;
-      AddEBNFSegment(R"([\u0000-\U0010FFFF])");
+      AddEBNFSegment(R"([\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF])");
       ++current_;
     } else {
       is_empty = false;

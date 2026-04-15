@@ -68,7 +68,7 @@ def test_escaped_char_class():
     regex = r"\w\w\W\d\D\s\S"
     instance = "A_ 1b 0"
     grammar_str = _regex_to_ebnf(regex)
-    expected_grammar = r"""root ::= [a-zA-Z0-9_] [a-zA-Z0-9_] [^a-zA-Z0-9_] [0-9] [^0-9] [\f\n\r\t\v\u0020\u00a0] [^[\f\n\r\t\v\u0020\u00a0]
+    expected_grammar = r"""root ::= [a-zA-Z0-9_] [a-zA-Z0-9_] [^a-zA-Z0-9_] [0-9] [^0-9] [\f\n\r\t\v\u0020\u00a0] [^\f\n\r\t\v\u0020\u00a0]
 """
     assert grammar_str == expected_grammar
     assert _is_grammar_accept_string(grammar_str, instance)
@@ -159,7 +159,7 @@ def test_any():
     regex = r".+a.+"
     instance = "bbbabb"
     grammar_str = _regex_to_ebnf(regex)
-    expected_grammar = r"""root ::= [\u0000-\U0010FFFF]+ "a" [\u0000-\U0010FFFF]+
+    expected_grammar = r"""root ::= [\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF]+ "a" [\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF]+
 """
     assert grammar_str == expected_grammar
     assert _is_grammar_accept_string(grammar_str, instance)
@@ -170,9 +170,9 @@ def test_ipv4():
     grammar_str = _regex_to_ebnf(regex)
     expected_grammar = (
         r"""root ::= ( ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] [0-9]? ) """
-        r"""[\u0000-\U0010FFFF] ) ( ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] """
-        r"""[0-9]? ) [\u0000-\U0010FFFF] ) ( ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] """
-        r"""[0-9]? ) [\u0000-\U0010FFFF] ) ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] [0-9]? )
+        r"""[\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF] ) ( ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] """
+        r"""[0-9]? ) [\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF] ) ( ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] """
+        r"""[0-9]? ) [\u0000-\u0009\u000B-\u000C\u000E-\u2027\u202A-\U0010FFFF] ) ( "2" "5" [0-5] | "2" [0-4] [0-9] | [01]? [0-9] [0-9]? )
 """
     )
     assert grammar_str == expected_grammar
@@ -303,6 +303,14 @@ def test_group_modifiers():
 """
     assert grammar_str == expected_grammar
     assert _is_grammar_accept_string(grammar_str, "abc")
+
+    regex = "(?<group_1$>abc)"
+    grammar_str = _regex_to_ebnf(regex)
+    assert grammar_str == expected_grammar
+    assert _is_grammar_accept_string(grammar_str, "abc")
+
+    with pytest.raises(RuntimeError, match="Invalid named capturing group."):
+        _regex_to_ebnf("(?<1group>abc)")
 
     # Test unsupported group modifiers
     unsupported_regexes = [

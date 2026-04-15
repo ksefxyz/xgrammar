@@ -71,14 +71,11 @@ class DynamicBitset {
         buffer_size_(other.buffer_size_),
         data_(),
         internal_buffer_(),
-        is_internal_(other.is_internal_) {
-    if (other.is_internal_) {
-      // copy the internal buffer
-      internal_buffer_ = other.internal_buffer_;
+        is_internal_(true) {
+    if (buffer_size_ > 0) {
+      internal_buffer_.resize(buffer_size_);
       data_ = internal_buffer_.data();
-    } else {
-      // simply point to the same external buffer
-      data_ = other.data_;
+      std::memcpy(data_, other.data_, buffer_size_ * sizeof(uint32_t));
     }
   }
 

@@ -397,9 +397,14 @@ void EarleyParser::ExpandNextRuleRefElement(
   auto ref_rule_id = (*sub_grammar_expr)[0];
 
   if (debug_print) {
-    XGRAMMAR_LOG(INFO) << "The rule " << state.rule_id << ": "
-                       << grammar_->GetRule(state.rule_id).name << " predict the new rule "
-                       << ref_rule_id << ": " << grammar_->GetRule(ref_rule_id).name << ".";
+    if (state.rule_id != -1) {
+      XGRAMMAR_LOG(INFO) << "The rule " << state.rule_id << ": "
+                         << grammar_->GetRule(state.rule_id).name << " predict the new rule "
+                         << ref_rule_id << ": " << grammar_->GetRule(ref_rule_id).name << ".";
+    } else {
+      XGRAMMAR_LOG(INFO) << "The sequence " << state.sequence_id << " predict the new rule "
+                         << ref_rule_id << ": " << grammar_->GetRule(ref_rule_id).name << ".";
+    }
   }
 
   bool right_recursion_to_root = false;
@@ -557,12 +562,13 @@ void EarleyParser::ExpandNextRuleRefElementOnFSM(const ParserState& state, bool 
       }
     }
 
-    // Check if the reference rule can be empty.
-    if (!is_repeat && std::binary_search(
+    const bool ref_rule_allows_empty =
+        !is_repeat && std::binary_search(
                           grammar_->allow_empty_rule_ids.begin(),
                           grammar_->allow_empty_rule_ids.end(),
                           ref_rule_id
-                      )) {
+                      );
+    if (ref_rule_allows_empty) {
       Enqueue(ParserState{state.rule_id, state.sequence_id, target, state.rule_start_pos, 0});
     }
 
@@ -571,13 +577,6 @@ void EarleyParser::ExpandNextRuleRefElementOnFSM(const ParserState& state, bool 
     const auto& ref_grammar_expr_id = ref_rule.body_expr_id;
 
     XGRAMMAR_DCHECK(grammar_->per_rule_fsms[ref_rule_id].has_value());
-    if (!is_repeat && std::binary_search(
-                          grammar_->allow_empty_rule_ids.begin(),
-                          grammar_->allow_empty_rule_ids.end(),
-                          ref_rule_id
-                      )) {
-      Enqueue(ParserState{state.rule_id, state.sequence_id, target, state.rule_start_pos, 0});
-    }
     const auto& ref_fsm = grammar_->per_rule_fsms[ref_rule_id].value();
     Enqueue(ParserState{
         ref_rule_id,

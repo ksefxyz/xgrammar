@@ -144,7 +144,7 @@ struct alignas(8) FSMEdge {
 /*! \brief View into edge_aux_data for a repeat edge (layout: [rule_id, lower, upper]). */
 struct RepeatEdgeRef {
   const int32_t* data;
-  int16_t RuleId() const { return static_cast<int16_t>(data[0]); }
+  int32_t RuleId() const { return data[0]; }
   int32_t Lower() const { return data[1]; }
   int32_t Upper() const { return data[2]; }
 };
