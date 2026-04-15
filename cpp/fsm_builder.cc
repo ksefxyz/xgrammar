@@ -18,10 +18,29 @@
 #include <vector>
 
 #include "fsm.h"
+#include "support/encoding.h"
 #include "support/logging.h"
 #include "support/utils.h"
 
 namespace xgrammar {
+
+namespace {
+
+std::optional<std::pair<int, int32_t>> ParseSingleByteEscape(
+    const std::string& regex, int start
+) {
+  auto [codepoint, len] = ParseNextEscaped(regex.c_str() + start);
+  if (codepoint == CharHandlingError::kInvalidEscape) {
+    return std::nullopt;
+  }
+  XGRAMMAR_CHECK(codepoint >= 0 && codepoint <= 0xFF)
+      << "RegexFSMBuilder only supports byte-valued escapes inside byte-oriented leaves and "
+         "character classes, but got codepoint "
+      << codepoint;
+  return std::make_pair(static_cast<int>(codepoint), len);
+}
+
+}  // namespace
 
 class RegexIR {
  public:
@@ -297,25 +316,17 @@ Result<FSMWithStartEnd> RegexIR::visit(const RegexIR::Repeat& state) const {
 
   // Handling {n,}
   if (state.upper_bound == RegexIR::kRepeatNoUpperBound) {
-    for (int i = 2; i < state.lower_bound; i++) {
-      result = FSMWithStartEnd::Concat(std::vector<FSMWithStartEnd>{result, child});
+    if (state.lower_bound == 0) {
+      return ResultOk(child.Star());
     }
-    int end_state_of_lower_bound_fsm = -1;
-    for (int end = 0; end < result.NumStates(); ++end) {
-      if (result.IsEndState(end)) {
-        end_state_of_lower_bound_fsm = end;
-        break;
-      }
+
+    for (int i = 2; i <= state.lower_bound; ++i) {
+      result = FSMWithStartEnd::Concat(std::vector<FSMWithStartEnd>{result, child.Copy()});
     }
-    XGRAMMAR_DCHECK(end_state_of_lower_bound_fsm != -1)
-        << "No end state found in the lower bound FSM.";
-    result = FSMWithStartEnd::Concat(std::vector<FSMWithStartEnd>{result, child});
-    for (int end = 0; end < result.NumStates(); ++end) {
-      if (result.IsEndState(end)) {
-        result.GetFsm().AddEpsilonEdge(end, end_state_of_lower_bound_fsm);
-      }
-    }
-    return ResultOk(std::move(result));
+
+    return ResultOk(FSMWithStartEnd::Concat(
+        std::vector<FSMWithStartEnd>{std::move(result), child.Copy().Star()}
+    ));
   }
   // Handling {n, m} or {n}
   for (int i = 2; i <= state.upper_bound; i++) {
@@ -355,6 +366,21 @@ FSMWithStartEnd RegexIR::BuildLeafFSMFromRegex(const std::string& regex) {
         result.AddState();
         continue;
       }
+      if (auto single_escape = ParseSingleByteEscape(regex, i)) {
+        std::string utf8 = CharToUTF8(single_escape->first);
+        for (unsigned char byte : utf8) {
+          result.GetFsm().AddEdge(
+              result.NumStates() - 1,
+              result.NumStates(),
+              static_cast<uint8_t>(byte),
+              static_cast<uint8_t>(byte)
+          );
+          result.AddState();
+        }
+        i += single_escape->second - 1;
+        continue;
+      }
+
       std::vector<std::pair<int, int>> escape_vector = HandleEscapes(regex, i);
       for (const auto& escape : escape_vector) {
         result.GetFsm().AddEdge(
@@ -375,81 +401,69 @@ FSMWithStartEnd RegexIR::BuildLeafFSMFromRegex(const std::string& regex) {
     result.AddEndState(1);
     bool reverse = regex[1] == '^';
     for (size_t i = reverse ? 2 : 1; i < regex.size() - 1; i++) {
+      int left_value = -1;
+      size_t left_len = 1;
+      std::optional<std::vector<std::pair<int, int>>> multi_match_edges = std::nullopt;
+
       if (regex[i] != '\\') {
-        if (!(((i + 2) < regex.size() - 1) && regex[i + 1] == '-')) {
-          // A single char.
-          result.GetFsm().AddEdge(
-              0, 1, static_cast<uint8_t>(regex[i]), static_cast<uint8_t>(regex[i])
-          );
-          continue;
-        }
-        // Handle the char range.
-        if (regex[i + 2] != '\\') {
-          result.GetFsm().AddEdge(
-              0, 1, static_cast<uint8_t>(regex[i]), static_cast<uint8_t>(regex[i + 2])
-          );
-          i = i + 2;
-          continue;
-        }
-        auto escaped_edges = HandleEscapes(regex, i + 2);
-        // Means it's not a range.
-        if (escaped_edges.size() != 1 || escaped_edges[0].first != escaped_edges[0].second) {
-          result.GetFsm().AddEdge(
-              0, 1, static_cast<uint8_t>(regex[i]), static_cast<uint8_t>(regex[i])
-          );
-          continue;
+        left_value = static_cast<uint8_t>(regex[i]);
+      } else if (auto single_escape = ParseSingleByteEscape(regex, static_cast<int>(i))) {
+        left_value = single_escape->first;
+        left_len = static_cast<size_t>(single_escape->second);
+      } else {
+        multi_match_edges = HandleEscapes(regex, static_cast<int>(i));
+        left_len = 2;
+      }
+
+      if (left_value != -1) {
+        size_t dash_pos = i + left_len;
+        if (dash_pos < regex.size() - 1 && regex[dash_pos] == '-') {
+          size_t right_pos = dash_pos + 1;
+          if (right_pos < regex.size() - 1) {
+            if (regex[right_pos] != '\\') {
+              result.GetFsm().AddEdge(
+                  0, 1, static_cast<uint8_t>(left_value), static_cast<uint8_t>(regex[right_pos])
+              );
+              i = right_pos;
+              continue;
+            }
+            if (auto single_escape = ParseSingleByteEscape(regex, static_cast<int>(right_pos))) {
+              result.GetFsm().AddEdge(
+                  0,
+                  1,
+                  static_cast<uint8_t>(left_value),
+                  static_cast<uint8_t>(single_escape->first)
+              );
+              i = dash_pos + static_cast<size_t>(single_escape->second);
+              continue;
+            }
+            auto escaped_edges = HandleEscapes(regex, static_cast<int>(right_pos));
+            if (escaped_edges.size() == 1 && escaped_edges[0].first == escaped_edges[0].second) {
+              result.GetFsm().AddEdge(
+                  0,
+                  1,
+                  static_cast<uint8_t>(left_value),
+                  static_cast<uint8_t>(escaped_edges[0].first)
+              );
+              i = right_pos + 1;
+              continue;
+            }
+          }
         }
         result.GetFsm().AddEdge(
-            0, 1, static_cast<uint8_t>(regex[0]), static_cast<uint8_t>(escaped_edges[0].first)
+            0, 1, static_cast<uint8_t>(left_value), static_cast<uint8_t>(left_value)
         );
-        i = i + 3;
+        i += left_len - 1;
         continue;
       }
-      auto escaped_edges = HandleEscapes(regex, i);
-      i = i + 1;
-      if (escaped_edges.size() != 1 || escaped_edges[0].first != escaped_edges[0].second) {
-        // It's a multi-match escape char.
-        for (const auto& edge : escaped_edges) {
-          result.GetFsm().AddEdge(
-              0, 1, static_cast<uint8_t>(edge.first), static_cast<uint8_t>(edge.second)
-          );
-        }
-        continue;
-      }
-      if (!(((i + 2) < regex.size() - 1) && regex[i + 1] == '-')) {
+
+      XGRAMMAR_DCHECK(multi_match_edges.has_value());
+      for (const auto& edge : multi_match_edges.value()) {
         result.GetFsm().AddEdge(
-            0,
-            1,
-            static_cast<uint8_t>(escaped_edges[0].first),
-            static_cast<uint8_t>(escaped_edges[0].second)
+            0, 1, static_cast<uint8_t>(edge.first), static_cast<uint8_t>(edge.second)
         );
-        continue;
       }
-      if (regex[i + 2] != '\\') {
-        result.GetFsm().AddEdge(
-            0, 1, static_cast<uint8_t>(escaped_edges[0].first), static_cast<uint8_t>(regex[i + 2])
-        );
-        i = i + 2;
-        continue;
-      }
-      auto rhs_escaped_edges = HandleEscapes(regex, i + 2);
-      if (rhs_escaped_edges.size() != 1 ||
-          rhs_escaped_edges[0].first != rhs_escaped_edges[0].second) {
-        result.GetFsm().AddEdge(
-            0,
-            1,
-            static_cast<uint8_t>(escaped_edges[0].first),
-            static_cast<uint8_t>(escaped_edges[0].second)
-        );
-        continue;
-      }
-      result.GetFsm().AddEdge(
-          0,
-          1,
-          static_cast<uint8_t>(escaped_edges[0].first),
-          static_cast<uint8_t>(rhs_escaped_edges[0].first)
-      );
-      i = i + 3;
+      i += left_len - 1;
       continue;
     }
     bool has_edge[0x100];
@@ -601,7 +615,11 @@ Result<FSMWithStartEnd> RegexFSMBuilder::Build(const std::string& regex) {
     }
     if (left_middle_bracket != -1) {
       if (regex[i] == '\\') {
-        i++;
+        if (auto single_escape = ParseSingleByteEscape(regex, i)) {
+          i += single_escape->second - 1;
+        } else {
+          i++;
+        }
       }
       continue;
     }
@@ -738,8 +756,13 @@ Result<FSMWithStartEnd> RegexFSMBuilder::Build(const std::string& regex) {
     if (regex[i] != '\\') {
       leaf.regex = regex[i];
     } else {
-      leaf.regex = regex.substr(i, 2);
-      i++;
+      if (auto single_escape = ParseSingleByteEscape(regex, i)) {
+        leaf.regex = regex.substr(i, single_escape->second);
+        i += single_escape->second - 1;
+      } else {
+        leaf.regex = regex.substr(i, 2);
+        i++;
+      }
     }
     stack.push(leaf);
     continue;

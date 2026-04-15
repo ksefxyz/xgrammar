@@ -965,13 +965,12 @@ FSMWithStartEnd FSMWithStartEnd::Plus() const {
 
 FSMWithStartEnd FSMWithStartEnd::Optional() const {
   FSM fsm = fsm_.Copy();
-  for (int end = 0; end < NumStates(); ++end) {
-    if (IsEndState(end)) {
-      fsm.AddEpsilonEdge(start_, end);
-      break;
-    }
+  std::vector<bool> new_ends = ends_;
+  if (static_cast<int>(new_ends.size()) <= start_) {
+    new_ends.resize(start_ + 1, false);
   }
-  return FSMWithStartEnd(fsm, start_, ends_);
+  new_ends[start_] = true;
+  return FSMWithStartEnd(fsm, start_, new_ends);
 }
 
 Result<FSMWithStartEnd> FSMWithStartEnd::Not(int max_result_num_states) const {

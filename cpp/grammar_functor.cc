@@ -7,6 +7,7 @@
 
 #include <xgrammar/xgrammar.h>
 
+#include <algorithm>
 #include <bitset>
 #include <cstdint>
 #include <map>
@@ -1212,7 +1213,7 @@ void AddSameLengthCharacterRange(
     if ((max & 0x00FFFF) != 0xBFBF) {
       int tmp_state_max = fsm.AddState();
       fsm.GetFsm().AddEdge(from, tmp_state_max, byte_max[2], byte_max[2]);
-      AddSameLengthCharacterRange(fsm, tmp_state_max, to, 0x0080, (max & 0x00FFFF));
+      AddSameLengthCharacterRange(fsm, tmp_state_max, to, 0x8080, (max & 0x00FFFF));
     } else {
       byte_max[2]++;
     }
@@ -1347,18 +1348,38 @@ FSMWithStartEnd GrammarFSMBuilderImpl::BuildNegativeCharacterClass(const Grammar
       expr.type == ExprType::kCharacterClass || expr.type == ExprType::kCharacterClassStar
   );
   XGRAMMAR_DCHECK(expr[0]);  // Negative character class should be true.
-  std::bitset<128> char_set;
+
+  constexpr uint32_t kMaxUnicodeCodepoint = 0x10FFFF;
+
+  std::vector<std::pair<uint32_t, uint32_t>> excluded_codepoint_ranges;
   for (int i = 1; i < static_cast<int>(expr.size()); i += 2) {
-    uint8_t byte_min = static_cast<uint8_t>(expr[i]);
-    uint8_t byte_max = static_cast<uint8_t>(expr[i + 1]);
-    if (byte_max > 128) {
-      XGRAMMAR_LOG(WARNING) << "Negative Character class contains byte greater than 127, "
-                            << "clamping to 127.";
-      byte_max = 127;
+    int64_t range_min = expr[i];
+    int64_t range_max = expr[i + 1];
+    if (range_max < 0 || range_min > kMaxUnicodeCodepoint) {
+      continue;
     }
-    for (uint8_t j = byte_min; j <= byte_max; ++j) {
-      char_set.set(j);
+    range_min = std::max<int64_t>(0, range_min);
+    range_max = std::min<int64_t>(kMaxUnicodeCodepoint, range_max);
+    if (range_min > range_max) {
+      continue;
     }
+    excluded_codepoint_ranges.emplace_back(
+        static_cast<uint32_t>(range_min), static_cast<uint32_t>(range_max)
+    );
+  }
+  std::sort(excluded_codepoint_ranges.begin(), excluded_codepoint_ranges.end());
+
+  std::vector<std::pair<uint32_t, uint32_t>> merged_excluded_codepoint_ranges;
+  for (const auto& [range_min, range_max] : excluded_codepoint_ranges) {
+    if (
+        merged_excluded_codepoint_ranges.empty() ||
+        range_min > merged_excluded_codepoint_ranges.back().second + 1
+    ) {
+      merged_excluded_codepoint_ranges.emplace_back(range_min, range_max);
+      continue;
+    }
+    merged_excluded_codepoint_ranges.back().second =
+        std::max(merged_excluded_codepoint_ranges.back().second, range_max);
   }
 
   // Construct the basic FSM.
@@ -1373,24 +1394,33 @@ FSMWithStartEnd GrammarFSMBuilderImpl::BuildNegativeCharacterClass(const Grammar
     end_state = result_fsm.AddState();
   }
   result_fsm.AddEndState(end_state);
-  int left_bound = -1;
-  for (int i = 0; i < 128; ++i) {
-    if (!char_set[i]) {
-      left_bound = i;
-      int right_bound = i + 1;
-      while (right_bound < 128 && !char_set[right_bound]) {
-        right_bound++;
-      }
-      result_fsm.GetFsm().AddEdge(
+
+  uint32_t next_allowed_codepoint = 0;
+  for (const auto& [range_min, range_max] : merged_excluded_codepoint_ranges) {
+    if (next_allowed_codepoint < range_min) {
+      AddCharacterRange(
+          result_fsm,
           start_state,
           end_state,
-          static_cast<uint8_t>(left_bound),
-          static_cast<uint8_t>(right_bound - 1)
+          CodepointToPackedUTF8(next_allowed_codepoint),
+          CodepointToPackedUTF8(range_min - 1)
       );
-      i = right_bound;
     }
+    if (range_max == kMaxUnicodeCodepoint) {
+      return result_fsm;
+    }
+    next_allowed_codepoint = range_max + 1;
   }
-  AddCharacterRange(result_fsm, start_state, end_state, kMin2BytesUnicode, kMax4BytesUnicode);
+
+  if (next_allowed_codepoint <= kMaxUnicodeCodepoint) {
+    AddCharacterRange(
+        result_fsm,
+        start_state,
+        end_state,
+        CodepointToPackedUTF8(next_allowed_codepoint),
+        CodepointToPackedUTF8(kMaxUnicodeCodepoint)
+    );
+  }
   return result_fsm;
 }
 

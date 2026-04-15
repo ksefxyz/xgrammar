@@ -9,6 +9,7 @@
 #include "earley_parser.h"
 #undef protected
 #undef private
+#include "grammar_builder.h"
 #include "grammar_functor.h"
 #include "grammar_parser.h"
 #include "support/encoding.h"
@@ -47,6 +48,18 @@ TEST(XGrammarUtilsTest, VectorHashWorksAsKeyHasher) {
   EXPECT_EQ(values.size(), 2U);
   EXPECT_EQ(values.count(std::vector<int>{1, 2, 3}), 1U);
   EXPECT_EQ(values.count(std::vector<int>{1, 2, 4}), 1U);
+}
+
+TEST(XGrammarUtilsTest, GrammarBuilderRejectsNegativeRuleIdsForLookaheadUpdates) {
+  GrammarBuilder builder;
+  builder.AddEmptyRule("root");
+
+  XGRAMMAR_EXPECT_THROW(
+      builder.UpdateLookaheadAssertion(-1, 0), std::exception, "Rule id -1 is out of range"
+  );
+  XGRAMMAR_EXPECT_THROW(
+      builder.UpdateLookaheadExact(-1, true), std::exception, "Rule id -1 is out of range"
+  );
 }
 
 TEST(XGrammarParserStateTest, DebugPrintOnSequencePredictionDoesNotReadInvalidRuleId) {

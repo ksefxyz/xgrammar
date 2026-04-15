@@ -11,9 +11,23 @@
 #include "fsm.h"
 #include "fsm_builder.h"
 #include "grammar_functor.h"
+#include "support/encoding.h"
 #include "xgrammar/grammar.h"
 
 using namespace xgrammar;
+
+namespace {
+
+std::string UTF8(uint32_t codepoint) {
+  return CharToUTF8(codepoint);
+}
+
+bool Accepts(FSMWithStartEnd fsm, const std::string& input) {
+  auto compact_fsm = fsm.ToCompact();
+  return compact_fsm.AcceptString(input);
+}
+
+}  // namespace
 
 TEST(XGrammarFSMBuilderTest, TestTrieFSMBuilder) {
   TrieFSMBuilder trie_builder;
@@ -230,15 +244,18 @@ TEST(XGrammarFSMBuilderTest, TestCharacterClassFSMBuilder3) {
   auto fsm = GrammarFSMBuilder::CharacterClass(grammar_expr);
   auto fsm_printed = fsm.ToString();
   std::string expected_fsm_printed =
-      R"(FSM(num_states=8, start=0, end=[1], edges=[
-0: [[\0-@]->1, [[-`]->1, [{-\x7f]->1, [\xc0-\xdf]->2, [\xe0-\xef]->3, [\xf0-\xf7]->5]
+      R"(FSM(num_states=11, start=0, end=[1], edges=[
+0: [[\0-@]->1, [[-`]->1, [{-\x7f]->1, [\xc0-\xdf]->2, [\xe0-\xef]->3, '\xf4'->5, [\xf0-\xf3]->8]
 1: []
 2: [[\x80-\xbf]->1]
 3: [[\x80-\xbf]->4]
 4: [[\x80-\xbf]->1]
-5: [[\x80-\xbf]->6]
+5: [[\x80-\x8f]->6]
 6: [[\x80-\xbf]->7]
 7: [[\x80-\xbf]->1]
+8: [[\x80-\xbf]->9]
+9: [[\x80-\xbf]->10]
+10: [[\x80-\xbf]->1]
 ]))";
   EXPECT_EQ(fsm_printed, expected_fsm_printed);
 }
@@ -251,16 +268,58 @@ TEST(XGrammarFSMBuilderTest, TestCharacterClassFSMBuilder4) {
   auto fsm = GrammarFSMBuilder::CharacterClass(grammar_expr);
   auto fsm_printed = fsm.ToString();
   std::string expected_fsm_printed =
-      R"(FSM(num_states=7, start=0, end=[0], edges=[
-0: [[\0-@]->0, [[-`]->0, [{-\x7f]->0, [\xc0-\xdf]->1, [\xe0-\xef]->2, [\xf0-\xf7]->4]
+      R"(FSM(num_states=10, start=0, end=[0], edges=[
+0: [[\0-@]->0, [[-`]->0, [{-\x7f]->0, [\xc0-\xdf]->1, [\xe0-\xef]->2, '\xf4'->4, [\xf0-\xf3]->7]
 1: [[\x80-\xbf]->0]
 2: [[\x80-\xbf]->3]
 3: [[\x80-\xbf]->0]
-4: [[\x80-\xbf]->5]
+4: [[\x80-\x8f]->5]
 5: [[\x80-\xbf]->6]
 6: [[\x80-\xbf]->0]
+7: [[\x80-\xbf]->8]
+8: [[\x80-\xbf]->9]
+9: [[\x80-\xbf]->0]
 ]))";
   EXPECT_EQ(fsm_printed, expected_fsm_printed);
+}
+
+TEST(XGrammarFSMBuilderTest, TestCharacterClassFSMBuilderThreeByteRangeUpperTail) {
+  std::vector<int32_t> datas = {0, 0x0800, 0x10A0};
+  GrammarExpr grammar_expr = {
+      GrammarExprType::kCharacterClass, datas.data(), static_cast<int32_t>(datas.size())
+  };
+  auto fsm = GrammarFSMBuilder::CharacterClass(grammar_expr);
+
+  EXPECT_TRUE(Accepts(fsm, UTF8(0x0800)));
+  EXPECT_TRUE(Accepts(fsm, UTF8(0x1040)));
+  EXPECT_TRUE(Accepts(fsm, UTF8(0x10A0)));
+  EXPECT_FALSE(Accepts(fsm, UTF8(0x07FF)));
+  EXPECT_FALSE(Accepts(fsm, UTF8(0x10A1)));
+}
+
+TEST(XGrammarFSMBuilderTest, TestNegativeCharacterClassBoundaryAtU0080) {
+  std::vector<int32_t> datas = {1, 0x0000, 0x0080};
+  GrammarExpr grammar_expr = {
+      GrammarExprType::kCharacterClass, datas.data(), static_cast<int32_t>(datas.size())
+  };
+  auto fsm = GrammarFSMBuilder::CharacterClass(grammar_expr);
+
+  EXPECT_FALSE(Accepts(fsm, std::string(1, 'A')));
+  EXPECT_FALSE(Accepts(fsm, UTF8(0x0080)));
+  EXPECT_TRUE(Accepts(fsm, UTF8(0x0081)));
+}
+
+TEST(XGrammarFSMBuilderTest, TestNegativeCharacterClassRejectsExcludedNonAsciiRange) {
+  std::vector<int32_t> datas = {1, 0x0080, 0x00FF};
+  GrammarExpr grammar_expr = {
+      GrammarExprType::kCharacterClass, datas.data(), static_cast<int32_t>(datas.size())
+  };
+  auto fsm = GrammarFSMBuilder::CharacterClass(grammar_expr);
+
+  EXPECT_TRUE(Accepts(fsm, std::string(1, 'A')));
+  EXPECT_FALSE(Accepts(fsm, UTF8(0x0080)));
+  EXPECT_FALSE(Accepts(fsm, UTF8(0x00FF)));
+  EXPECT_TRUE(Accepts(fsm, UTF8(0x0100)));
 }
 
 TEST(XGrammarFSMBuilderTest, TestSequenceFSMBuilder) {

@@ -421,6 +421,54 @@ TEST(XGrammarFSMTest, EfficiencyTest) {
   std::cout << "--------- Efficiency Test Passed! -----------" << std::endl;
 }
 
+TEST(XGrammarFSMTest, RegexRangeWithEscapedUpperBoundUsesCurrentLeftChar) {
+  auto fsm_wse = RegexFSMBuilder::Build("[a-\\}]").Unwrap();
+
+  EXPECT_TRUE(fsm_wse.AcceptString("a"));
+  EXPECT_TRUE(fsm_wse.AcceptString("m"));
+  EXPECT_TRUE(fsm_wse.AcceptString("z"));
+  EXPECT_TRUE(fsm_wse.AcceptString("{"));
+  EXPECT_TRUE(fsm_wse.AcceptString("}"));
+  EXPECT_FALSE(fsm_wse.AcceptString("["));
+  EXPECT_FALSE(fsm_wse.AcceptString("\\"));
+}
+
+TEST(XGrammarFSMTest, UnboundedRepeatRespectsLowerBoundsZeroAndOne) {
+  auto star_like = RegexFSMBuilder::Build("a{0,}").Unwrap();
+  EXPECT_TRUE(star_like.AcceptString(""));
+  EXPECT_TRUE(star_like.AcceptString("a"));
+  EXPECT_TRUE(star_like.AcceptString("aa"));
+  EXPECT_FALSE(star_like.AcceptString("b"));
+
+  auto plus_like = RegexFSMBuilder::Build("a{1,}").Unwrap();
+  EXPECT_FALSE(plus_like.AcceptString(""));
+  EXPECT_TRUE(plus_like.AcceptString("a"));
+  EXPECT_TRUE(plus_like.AcceptString("aa"));
+  EXPECT_FALSE(plus_like.AcceptString("b"));
+}
+
+TEST(XGrammarFSMTest, OptionalDoesNotBypassRequiredPrefixOfCompoundFSM) {
+  auto optional = RegexFSMBuilder::Build("((a|b)c+)?").Unwrap();
+
+  EXPECT_TRUE(optional.AcceptString(""));
+  EXPECT_TRUE(optional.AcceptString("ac"));
+  EXPECT_TRUE(optional.AcceptString("bc"));
+  EXPECT_TRUE(optional.AcceptString("accc"));
+  EXPECT_FALSE(optional.AcceptString("c"));
+  EXPECT_FALSE(optional.AcceptString("cc"));
+}
+
+TEST(XGrammarFSMTest, RegexFSMBuilderSupportsHexAndUnicodeEscapes) {
+  auto escaped_string = RegexFSMBuilder::Build("\\x41\\u0042\\U00000043").Unwrap();
+  EXPECT_TRUE(escaped_string.AcceptString("ABC"));
+  EXPECT_FALSE(escaped_string.AcceptString("x41u0042U00000043"));
+
+  auto control_class = RegexFSMBuilder::Build("[\\x00-\\x1F]").Unwrap();
+  EXPECT_TRUE(control_class.AcceptString(std::string(1, '\n')));
+  EXPECT_TRUE(control_class.AcceptString(std::string(1, '\x1F')));
+  EXPECT_FALSE(control_class.AcceptString("A"));
+}
+
 TEST(XGrammarFSMTest, TestEmail) {
   std::string email_pattern = R"((\w+)(\.\w+)*@(\w+)(\.\w+)+)";
   auto fsm_wse = RegexFSMBuilder::Build(email_pattern).Unwrap();
