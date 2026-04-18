@@ -57,9 +57,9 @@ class RegexConverter {
 
   std::string regex_;
   std::vector<TCodepoint> regex_codepoints_;
-  TCodepoint* start_;
-  TCodepoint* current_;
-  TCodepoint* end_;
+  TCodepoint* start_ = nullptr;
+  TCodepoint* current_ = nullptr;
+  TCodepoint* end_ = nullptr;
   std::string result_ebnf_;
   int parenthesis_level_ = 0;
 };

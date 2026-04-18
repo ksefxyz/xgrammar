@@ -7,11 +7,13 @@
 
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <utility>
 
 #include "fsm.h"
 #include "fsm_builder.h"
 #include "support/logging.h"
+#include "test_utils.h"
 
 using namespace xgrammar;
 
@@ -280,6 +282,18 @@ TEST(XGrammarFSMTest, FunctionTest) {
   EXPECT_FALSE(fsm_wse.AcceptString(""));
   EXPECT_FALSE(fsm_wse.AcceptString("cd"));
   std::cout << "--------- Function Test Passed! -----------" << std::endl;
+}
+
+TEST(XGrammarFSMTest, AddFSMRejectsAuxOffsetOverflow) {
+  FSM base(std::vector<std::vector<FSMEdge>>(1), std::vector<int32_t>(
+                                                  static_cast<size_t>(std::numeric_limits<int16_t>::max()) + 1,
+                                                  0
+                                              ));
+  FSM other(1);
+
+  XGRAMMAR_EXPECT_THROW(
+      base.AddFSM(other), std::exception, "edge_aux_data_ overflow: too many auxiliary data entries"
+  );
 }
 
 TEST(XGrammarFSMTest, EfficiencyTest) {

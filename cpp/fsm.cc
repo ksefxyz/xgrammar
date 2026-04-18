@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <queue>
@@ -399,6 +400,8 @@ void FSM::Impl::Advance(
 
 void FSM::Impl::AddFSM(const FSM& fsm, std::vector<int>* state_mapping) {
   int old_num_states = NumStates();
+  XGRAMMAR_CHECK(edge_aux_data_.size() <= static_cast<size_t>(std::numeric_limits<int16_t>::max()))
+      << "edge_aux_data_ overflow: too many auxiliary data entries";
   int16_t aux_offset = static_cast<int16_t>(edge_aux_data_.size());
 
   const auto& other_aux = fsm.GetEdgeAuxData();
@@ -418,6 +421,8 @@ void FSM::Impl::AddFSM(const FSM& fsm, std::vector<int>* state_mapping) {
     for (const auto& edge : fsm.GetEdges()[i]) {
       int16_t max_val = edge.max;
       if (edge.IsAuxEdge() && aux_offset > 0) {
+        XGRAMMAR_CHECK(edge.max <= std::numeric_limits<int16_t>::max() - aux_offset)
+            << "edge_aux_data_ overflow: auxiliary edge index exceeds int16_t range";
         max_val = static_cast<int16_t>(edge.max + aux_offset);
       }
       AddEdge(i + old_num_states, edge.target + old_num_states, edge.min, max_val);
@@ -1330,9 +1335,9 @@ FSMWithStartEnd FSMWithStartEnd::MergeEquivalentSuccessors(int max_result_num_st
         if (edges_to_i.size() != edges_to_sibling.size()) {
           break;  // Different edges, not equivalent.
         }
-        for (int i = 0; i < static_cast<int>(edges_to_i.size()); i++) {
-          if (edges_to_i[i].min != edges_to_sibling[i].min ||
-              edges_to_i[i].max != edges_to_sibling[i].max) {
+        for (int edge_idx = 0; edge_idx < static_cast<int>(edges_to_i.size()); edge_idx++) {
+          if (edges_to_i[edge_idx].min != edges_to_sibling[edge_idx].min ||
+              edges_to_i[edge_idx].max != edges_to_sibling[edge_idx].max) {
             is_equiv = false;
             break;  // Different edge ranges, not equivalent.
           }
@@ -1378,9 +1383,9 @@ FSMWithStartEnd FSMWithStartEnd::MergeEquivalentSuccessors(int max_result_num_st
           continue;  // Different number of edges, not equivalent.
         }
         bool is_equiv = true;
-        for (int i = 0; i < static_cast<int>(sibling_node_edges.size()); i++) {
-          if (sibling_node_edges[i].min != node_edges[i].min ||
-              sibling_node_edges[i].max != node_edges[i].max) {
+        for (int edge_idx = 0; edge_idx < static_cast<int>(sibling_node_edges.size()); edge_idx++) {
+          if (sibling_node_edges[edge_idx].min != node_edges[edge_idx].min ||
+              sibling_node_edges[edge_idx].max != node_edges[edge_idx].max) {
             is_equiv = false;
             break;
           }
@@ -1390,7 +1395,7 @@ FSMWithStartEnd FSMWithStartEnd::MergeEquivalentSuccessors(int max_result_num_st
           union_find_set.Add(i);
           union_find_set.Add(sibling);
           union_find_set.Union(i, sibling);
-          is_equiv_successor = true;
+          is_equiv_precursor = true;
         }
       }
     }
@@ -1503,8 +1508,9 @@ Result<FSMWithStartEnd> FSMWithStartEnd::MinimizeDFA(int max_num_states) const {
     std::vector<int> intersection;
     std::vector<int> difference;
     for (const auto& [transition, precursors] : possible_transitions) {
-      for (size_t i = 0; i < partitions.size(); i++) {
-        const auto& partition = partitions[i];
+      size_t partition_count = partitions.size();
+      for (size_t i = 0; i < partition_count; i++) {
+        auto partition = partitions[i];
         intersection.clear();  // partition \cap precursors
         difference.clear();    // partition - precursors
         for (const auto& partition_state : partition) {

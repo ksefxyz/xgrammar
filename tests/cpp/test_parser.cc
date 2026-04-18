@@ -100,6 +100,25 @@ TEST(XGrammarParserStateTest, DebugPrintOnSequencePredictionDoesNotReadInvalidRu
   });
 }
 
+TEST(XGrammarParserStateTest, PopLastStatesZeroDoesNotClearStopTokenFlag) {
+  auto grammar = GrammarOptimizer::Apply(Grammar::FromEBNF(R"(
+    root ::= "a"
+  )"));
+  EarleyParser parser(grammar, ParserState::GetInvalidState(), false);
+
+  parser.stop_token_is_accepted_ = true;
+  auto completable_size = parser.rule_id_to_completable_states_.size();
+  auto completed_size = parser.is_completed_.size();
+  auto scanable_size = parser.scanable_state_history_.size();
+
+  parser.PopLastStates(0);
+
+  EXPECT_TRUE(parser.stop_token_is_accepted_);
+  EXPECT_EQ(parser.rule_id_to_completable_states_.size(), completable_size);
+  EXPECT_EQ(parser.is_completed_.size(), completed_size);
+  EXPECT_EQ(parser.scanable_state_history_.size(), scanable_size);
+}
+
 // Note: the inputs to the lexer tests may not be valid EBNF
 TEST(XGrammarLexerTest, BasicTokenization) {
   // Test basic token types
@@ -550,6 +569,17 @@ TEST(XGrammarLexerTest, LexerErrorCases) {
     XGRAMMAR_EXPECT_THROW(EBNFLexer().Tokenize(input), std::exception, "Unexpected character: ':'");
   }
 
+  // Test for short colon-only inputs at EOF
+  {
+    std::string input = ":";
+    XGRAMMAR_EXPECT_THROW(EBNFLexer().Tokenize(input), std::exception, "Unexpected character: ':'");
+  }
+
+  {
+    std::string input = "::";
+    XGRAMMAR_EXPECT_THROW(EBNFLexer().Tokenize(input), std::exception, "Unexpected character: ':'");
+  }
+
   // Test for assign preceded by non-identifier
   {
     std::string input = "\"string\" ::= expr";
@@ -575,4 +605,14 @@ TEST(XGrammarLexerTest, LexerErrorCases) {
         "The rule name should be at the beginning of the line"
     );
   }
+}
+
+TEST(XGrammarEncodingTest, ParseNextEscapedRejectsHexOverflow) {
+  auto [codepoint, consumed] = ParseNextEscaped("\\xFFFFFFFFF");
+  EXPECT_EQ(codepoint, CharHandlingError::kInvalidEscape);
+  EXPECT_EQ(consumed, 0);
+}
+
+TEST(XGrammarEncodingTest, CharToUTF8RejectsSurrogates) {
+  XGRAMMAR_EXPECT_THROW(CharToUTF8(0xD800), std::exception, "Invalid codepoint");
 }

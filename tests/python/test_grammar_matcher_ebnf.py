@@ -85,6 +85,14 @@ def test_utf8():
         assert _is_grammar_accept_string(grammar, input_str, print_time=True)
 
 
+def test_non_ascii_character_class_does_not_accept_ascii_bytes():
+    grammar = xgr.Grammar.from_ebnf(r"root ::= [\u0100-\U0010FFFF]")
+
+    assert not _is_grammar_accept_string(grammar, "A")
+    assert _is_grammar_accept_string(grammar, "Ā")
+    assert _is_grammar_accept_string(grammar, "你")
+
+
 def test_custom_root_rule():
     json_grammar_simple_ebnf = r"""
 root ::= basic_object

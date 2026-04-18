@@ -86,7 +86,7 @@ def apply_token_bitmask_inplace_triton(
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     BLOCK_SIZE = 4096
 
-    arch = torch.cuda.get_device_properties(0).gcnArchName
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
     if torch.version.hip is not None and "gfx1" not in arch:
         # For AMD GPUs (non-Navi)
         WARP_SIZE = 64

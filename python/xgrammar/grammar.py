@@ -78,7 +78,7 @@ def _convert_schema_to_str(schema: Union[str, Type[BaseModel], Dict[str, Any]]) 
         if hasattr(schema, "model_json_schema"):
             return json.dumps(schema.model_json_schema())
         if hasattr(schema, "schema_json"):
-            return json.dumps(schema.schema_json())
+            return schema.schema_json()
         else:
             raise ValueError("The schema should have a model_json_schema or json_schema method.")
     elif isinstance(schema, str):

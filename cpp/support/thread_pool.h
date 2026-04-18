@@ -7,6 +7,7 @@
 #define XGRAMMAR_SUPPORT_THREAD_POOL_H_
 
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -51,7 +52,11 @@ class ThreadPool {
             task = std::move(task_queue_.front());
             task_queue_.pop();
           }
-          task();
+          try {
+            task();
+          } catch (...) {
+            StoreTaskException(std::current_exception());
+          }
           TaskComplete();
         }
       });
@@ -112,8 +117,16 @@ class ThreadPool {
   }
 
   void Wait() {
-    std::unique_lock<std::mutex> lock(queue_mutex_);
-    tasks_done_condition_.wait(lock, [this] { return unfinished_task_count_ == 0; });
+    std::exception_ptr task_exception;
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      tasks_done_condition_.wait(lock, [this] { return unfinished_task_count_ == 0; });
+      task_exception = task_exception_;
+      task_exception_ = nullptr;
+    }
+    if (task_exception != nullptr) {
+      std::rethrow_exception(task_exception);
+    }
   }
 
   /*!
@@ -134,12 +147,20 @@ class ThreadPool {
     for (std::thread& worker : workers_) {
       if (worker.joinable()) worker.join();  // Wait for thread to finish
     }
+    if (task_exception_ != nullptr) {
+      std::rethrow_exception(task_exception_);
+    }
   }
 
   /*!
    * \brief Destructor that ensures graceful shutdown of the thread pool.
    */
-  ~ThreadPool() { Join(); }
+  ~ThreadPool() {
+    try {
+      Join();
+    } catch (...) {
+    }
+  }
 
   // Prevent copying or moving of the thread pool
   ThreadPool(const ThreadPool&) = delete;
@@ -148,6 +169,13 @@ class ThreadPool {
   ThreadPool& operator=(ThreadPool&&) = delete;
 
  private:
+  void StoreTaskException(std::exception_ptr exception) {
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    if (task_exception_ == nullptr) {
+      task_exception_ = exception;
+    }
+  }
+
   void TaskComplete() {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     --unfinished_task_count_;
@@ -170,9 +198,15 @@ class ThreadPool {
   bool shutdown_ = false;
   /*! \brief Number of unfinished tasks */
   int unfinished_task_count_ = 0;
+  /*! \brief First exception thrown by an Execute task */
+  std::exception_ptr task_exception_ = nullptr;
 };
 
 inline void ParallelFor(int low, int high, int num_threads, std::function<void(int)> f) {
+  if (high <= low) {
+    return;
+  }
+  XGRAMMAR_CHECK(num_threads > 0) << "num_threads must be positive";
   if (high - low == 1) {
     f(low);
     return;

@@ -18,6 +18,7 @@
 #include "support/dynamic_bitset.h"
 #include "support/json_serializer.h"
 #include "support/memory_size.h"
+#include "test_utils.h"
 #include "tokenizer_info_impl.h"
 
 namespace xgrammar {
@@ -439,6 +440,40 @@ TEST(XGrammarSerializationTest, TestCompact2DArray) {
     ASSERT_EQ(json_value.serialize(), json_value2.serialize());
   }
 
+  // Malformed deserialization with empty indptr should not produce negative size.
+  {
+    picojson::object obj;
+    obj["data_"] = picojson::value(picojson::array{});
+    obj["indptr_"] = picojson::value(picojson::array{});
+
+    Compact2DArray<int> deserialized;
+    auto error = AutoDeserializeJSONValue(&deserialized, picojson::value(obj));
+    ASSERT_FALSE(error.has_value());
+    ASSERT_EQ(deserialized.size(), 0);
+  }
+
+  // PopBack should reject counts larger than the row count.
+  {
+    Compact2DArray<int> array;
+    XGRAMMAR_EXPECT_THROW(array.PopBack(1), std::exception, "PopBack count 1 is out of range");
+  }
+
+  // Pushing back a row that aliases internal storage should copy safely.
+  {
+    Compact2DArray<int> array;
+    array.PushBack({1, 2, 3});
+    auto row = array[0];
+    array.PushBack(row);
+
+    ASSERT_EQ(array.size(), 2);
+    EXPECT_EQ(array[0][0], 1);
+    EXPECT_EQ(array[0][1], 2);
+    EXPECT_EQ(array[0][2], 3);
+    EXPECT_EQ(array[1][0], 1);
+    EXPECT_EQ(array[1][1], 2);
+    EXPECT_EQ(array[1][2], 3);
+  }
+
   // Test with FSMEdge
   {
     Compact2DArray<FSMEdge> array;
@@ -616,6 +651,39 @@ TEST(XGrammarSerializationTest, TestDynamicBitset) {
 
     ASSERT_TRUE(copied[3]);
     ASSERT_FALSE(external[3]);
+  }
+
+  // Move assignment should leave the source in an empty safe state.
+  {
+    DynamicBitset source(10);
+    source.Set(9);
+    DynamicBitset target(1);
+
+    target = std::move(source);
+
+    ASSERT_EQ(target.Size(), 10);
+    ASSERT_TRUE(target[9]);
+    ASSERT_EQ(source.Size(), 0);
+  }
+
+  // Deserialization should reject arrays missing buffer words.
+  {
+    picojson::array arr = {picojson::value(int64_t{10}), picojson::value(int64_t{1})};
+    DynamicBitset deserialized;
+    auto error = AutoDeserializeJSONValue(&deserialized, picojson::value(arr));
+    ASSERT_TRUE(error.has_value());
+    ASSERT_NE(
+        GetMessageFromVariantError(*error).find("Except enough uint32 words for the buffer"),
+        std::string::npos
+    );
+  }
+
+  // Copy assignment to external storage should fail in release builds when it would expand.
+  {
+    uint32_t storage[1] = {0};
+    DynamicBitset external(10, storage);
+    DynamicBitset larger(64);
+    XGRAMMAR_EXPECT_THROW(external = larger, std::exception, "Expanding bitset size");
   }
 }
 

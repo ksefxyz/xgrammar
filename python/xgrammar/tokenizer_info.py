@@ -135,9 +135,6 @@ class TokenizerInfo(XGRObject):
         is_byte_level : bool
             The tokenizer has byte-level whitespace conversion.
         """
-        if tiktoken is None:
-            return False
-
         # check the tokenizer with r' ' encode
         new_ids = tokenizer.encode(r" ")
         if new_ids.__len__() < 1:
@@ -149,25 +146,32 @@ class TokenizerInfo(XGRObject):
 
     @staticmethod
     def _is_sentencepiece_tokenizer(tokenizer: PreTrainedTokenizerBase) -> bool:
+        return TokenizerInfo._get_sentencepiece_processor(tokenizer) is not None
+
+    @staticmethod
+    def _get_sentencepiece_processor(tokenizer: PreTrainedTokenizerBase) -> Optional[Any]:
         if sentencepiece is None:
-            return False
+            return None
 
-        # helper to check if tokenizer is a sentence piece tokenizer
-        has_sp_model_attr = hasattr(tokenizer, "sp_model") and isinstance(
+        if hasattr(tokenizer, "sp_model") and isinstance(
             tokenizer.sp_model, sentencepiece.SentencePieceProcessor
-        )
+        ):
+            return tokenizer.sp_model
 
-        has_nested_sp_model_attr = (
+        if (
             hasattr(tokenizer, "tokenizer")
             and hasattr(tokenizer.tokenizer, "sp_model")
             and isinstance(tokenizer.tokenizer.sp_model, sentencepiece.SentencePieceProcessor)
-        ) or (
-            # Support Teuken-7B-instruct-v0.6
-            hasattr(tokenizer, "tok")
-            and isinstance(tokenizer.tok, sentencepiece.SentencePieceProcessor)
-        )
+        ):
+            return tokenizer.tokenizer.sp_model
 
-        return has_sp_model_attr or has_nested_sp_model_attr
+        if hasattr(tokenizer, "tok") and isinstance(
+            tokenizer.tok, sentencepiece.SentencePieceProcessor
+        ):
+            # Support Teuken-7B-instruct-v0.6
+            return tokenizer.tok
+
+        return None
 
     @staticmethod
     def from_huggingface(
@@ -302,12 +306,8 @@ class TokenizerInfo(XGRObject):
         elif TokenizerInfo._is_sentencepiece_tokenizer(tokenizer):
             # sentencepiece tokenizer
             # e.g. Chatglm3-6b
-            if hasattr(tokenizer, "sp_model"):
-                sp_model = tokenizer.sp_model
-            elif hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model"):
-                sp_model = tokenizer.tokenizer.sp_model
-            elif hasattr(tokenizer, "tok"):
-                sp_model = tokenizer.tok
+            sp_model = TokenizerInfo._get_sentencepiece_processor(tokenizer)
+            assert sp_model is not None
 
             if stop_token_ids is None:
                 if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:

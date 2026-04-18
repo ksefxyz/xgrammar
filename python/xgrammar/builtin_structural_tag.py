@@ -32,8 +32,8 @@ BuiltinSupportedModels = Literal[
 def get_builtin_structural_tag(
     model: BuiltinSupportedModels,
     reasoning: bool = True,
-    tools: List[Dict[str, Any]] = [],
-    builtin_tools: List[Dict[str, Any]] = [],
+    tools: Optional[List[Dict[str, Any]]] = None,
+    builtin_tools: Optional[List[Dict[str, Any]]] = None,
     force_empty_reasoning: bool = False,
 ) -> StructuralTag:
     r"""Get structural tag for model. This function can generate structural tag for the given model
@@ -69,6 +69,8 @@ def get_builtin_structural_tag(
         raise ValueError("The 'reasoning' key in the input_dict must be a boolean.")
     if not isinstance(force_empty_reasoning, bool):
         raise ValueError("The 'force_empty_reasoning' key in the input_dict must be a boolean.")
+    tools = [] if tools is None else tools
+    builtin_tools = [] if builtin_tools is None else builtin_tools
     _validate_tool_function(tools)
     _validate_tool_function(builtin_tools)
 
@@ -718,7 +720,7 @@ def _get_glm47_structural_tag(input_dict: Dict[str, Any]) -> StructuralTag:
             continue
 
         function = tool["function"]
-        parameters = function["parameters"]
+        parameters = _get_function_parameters(function)
         name = function["name"]
         tags.append(
             TagFormat(

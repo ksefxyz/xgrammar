@@ -135,6 +135,47 @@ d_1 ::= ("" | ("d"))
     );
     expect(grammar.toString()).toEqual(legacyGrammar.toString());
   });
+
+  test("Test Grammar.fromStructuralTag() accepts expanded structural tag format types", async () => {
+    const formats = [
+      { type: "token", token: 1 },
+      { type: "exclude_token", exclude_tokens: [1, 2] },
+      { type: "any_tokens", exclude_tokens: [1, 2] },
+      {
+        type: "token_triggered_tags",
+        trigger_tokens: [10],
+        tags: [
+          {
+            type: "tag",
+            begin: { type: "token", token: 99 },
+            content: { type: "const_string", value: "E" },
+            end: { type: "token", token: 88 },
+          },
+        ],
+        stop_after_first: true,
+      },
+      { type: "optional", content: { type: "const_string", value: "x" } },
+      { type: "plus", content: { type: "const_string", value: "x" } },
+      { type: "star", content: { type: "const_string", value: "x" } },
+      { type: "repeat", min: 1, max: 3, content: { type: "const_string", value: "x" } },
+      {
+        type: "dispatch",
+        rules: [["<start>", { type: "const_string", value: "x" }]],
+        loop: false,
+      },
+      {
+        type: "token_dispatch",
+        rules: [[1, { type: "const_string", value: "x" }]],
+        loop: false,
+      },
+    ];
+
+    for (const format of formats) {
+      const grammar = await Grammar.fromStructuralTag(format as any);
+      expect(grammar.toString()).not.toEqual("");
+      grammar.dispose();
+    }
+  });
 });
 
 describe("Test TokenizerInfo", () => {

@@ -21,6 +21,22 @@ export interface QwenXMLParameterFormat {
 
 export interface AnyTextFormat {
   type: "any_text";
+  excludes?: string[];
+}
+
+export interface TokenFormat {
+  type: "token";
+  token: number | string;
+}
+
+export interface ExcludeTokenFormat {
+  type: "exclude_token";
+  exclude_tokens?: Array<number | string>;
+}
+
+export interface AnyTokensFormat {
+  type: "any_tokens";
+  exclude_tokens?: Array<number | string>;
 }
 
 export interface GrammarFormat {
@@ -45,15 +61,25 @@ export interface OrFormat {
 
 export interface TagFormat {
   type: "tag";
-  begin: string;
+  begin: string | TokenFormat;
   content: StructuralTagFormat;
-  end: string;
+  end: string | string[] | TokenFormat;
 }
 
 export interface TriggeredTagsFormat {
   type: "triggered_tags";
   triggers: string[];
   tags: TagFormat[];
+  at_least_one?: boolean;
+  stop_after_first?: boolean;
+  excludes?: string[];
+}
+
+export interface TokenTriggeredTagsFormat {
+  type: "token_triggered_tags";
+  trigger_tokens: Array<number | string>;
+  tags: TagFormat[];
+  exclude_tokens?: Array<number | string>;
   at_least_one?: boolean;
   stop_after_first?: boolean;
 }
@@ -66,16 +92,62 @@ export interface TagsWithSeparatorFormat {
   stop_after_first?: boolean;
 }
 
+export interface OptionalFormat {
+  type: "optional";
+  content: StructuralTagFormat;
+}
+
+export interface PlusFormat {
+  type: "plus";
+  content: StructuralTagFormat;
+}
+
+export interface StarFormat {
+  type: "star";
+  content: StructuralTagFormat;
+}
+
+export interface RepeatFormat {
+  type: "repeat";
+  min: number;
+  max: number;
+  content: StructuralTagFormat;
+}
+
+export interface DispatchFormat {
+  type: "dispatch";
+  rules: Array<[string, StructuralTagFormat]>;
+  loop?: boolean;
+  excludes?: string[];
+}
+
+export interface TokenDispatchFormat {
+  type: "token_dispatch";
+  rules: Array<[number | string, StructuralTagFormat]>;
+  loop?: boolean;
+  exclude_tokens?: Array<number | string>;
+}
+
 export type StructuralTagFormat =
   | AnyTextFormat
+  | AnyTokensFormat
   | ConstStringFormat
+  | DispatchFormat
+  | ExcludeTokenFormat
   | JSONSchemaFormat
   | GrammarFormat
+  | OptionalFormat
+  | PlusFormat
   | RegexFormat
+  | RepeatFormat
   | QwenXMLParameterFormat
   | OrFormat
   | SequenceFormat
+  | StarFormat
   | TagFormat
+  | TokenDispatchFormat
+  | TokenFormat
+  | TokenTriggeredTagsFormat
   | TriggeredTagsFormat
   | TagsWithSeparatorFormat;
 
@@ -190,6 +262,16 @@ const STRUCTURAL_TAG_FORMAT_TYPES = new Set([
   "json_schema",
   "qwen_xml_parameter",
   "regex",
+  "token",
+  "exclude_token",
+  "any_tokens",
+  "token_triggered_tags",
+  "optional",
+  "plus",
+  "star",
+  "repeat",
+  "dispatch",
+  "token_dispatch",
   "sequence",
   "or",
   "tag",

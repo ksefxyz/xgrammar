@@ -33,7 +33,10 @@ class RecursionGuard {
   explicit RecursionGuard(int* current_recursion_depth)
       : current_depth_ptr_(current_recursion_depth) {
     auto error = AddRecursionDepth(current_depth_ptr_);
-    XGRAMMAR_CHECK(error == std::nullopt) << error.value().what();
+    if (error != std::nullopt) {
+      SubtractRecursionDepth(current_depth_ptr_);
+      XGRAMMAR_LOG(FATAL) << error->what();
+    }
   }
 
   /*!

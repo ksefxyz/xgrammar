@@ -1490,6 +1490,14 @@ def test_get_glm47_structural_tag_instance():
     )
 
 
+def test_get_glm47_structural_tag_accepts_non_strict_function_without_parameters():
+    stag = get_builtin_structural_tag(
+        "glm47", tools=[{"function": {"name": "search", "strict": False}}], reasoning=False
+    )
+    grammar = xgr.Grammar.from_structural_tag(stag)
+    assert str(grammar)
+
+
 # ----- qwen_coder
 
 _qwen_coder_instances_with_tools = [

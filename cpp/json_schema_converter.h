@@ -71,10 +71,16 @@ struct AnySpec {
 
 // Complex Type Specs
 struct ArraySpec {
+  struct ContainsSubset {
+    uint64_t mask;
+    SchemaSpecPtr schema;
+  };
+
   std::vector<SchemaSpecPtr> prefix_items;
   bool allow_additional_items = true;
   SchemaSpecPtr additional_items;  // nullptr means not allowed
-  SchemaSpecPtr contains_item;     // nullptr means no contains constraint
+  std::vector<SchemaSpecPtr> contains_items;  // each entry must match at least one item
+  std::vector<ContainsSubset> contains_subsets;  // normalized satisfiable intersections of contains_items
   int64_t min_contains = 0;        // only 0 or 1 supported
   int64_t min_items = 0;
   int64_t max_items = -1;  // -1 means no limit
@@ -98,6 +104,7 @@ struct ObjectSpec {
   std::unordered_set<std::string> required;
   std::unordered_map<std::string, std::vector<std::string>> dependent_required;
   std::vector<std::vector<std::string>> forbidden_groups;
+  std::vector<std::pair<std::string, std::vector<std::string>>> forbidden_property_values;
 
   bool allow_additional_properties = false;
   SchemaSpecPtr additional_properties_schema;

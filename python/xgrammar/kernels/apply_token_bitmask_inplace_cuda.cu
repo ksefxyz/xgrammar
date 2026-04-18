@@ -84,9 +84,11 @@ __global__ void __launch_bounds__(THREADS_PER_THREAD_BLOCK) LogitsBitmaskKernel(
 #pragma unroll
   for (int offset = threadIdx.x * kAlignment; offset < THREADS_PER_THREAD_BLOCK * kBitsPerThread;
        offset += THREADS_PER_THREAD_BLOCK * kAlignment) {
-    if (block_offset + offset >= vocab_size) {
+    const int logical_offset = block_offset + offset;
+    if (logical_offset >= vocab_size) {
       break;
     }
+    const int remaining = vocab_size - logical_offset;
 
     const uint32_t bitmask_val =
         (~bitmask_gmem_ptr[offset / BITS_PER_BLOCK] >> (bitmask_inner_idx * kAlignment)) &
@@ -96,8 +98,18 @@ __global__ void __launch_bounds__(THREADS_PER_THREAD_BLOCK) LogitsBitmaskKernel(
       continue;
     }
 
-    if (bitmask_val == kPackedMask) {
+    if (remaining >= kAlignment && bitmask_val == kPackedMask) {
       *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset) = PackedNegativeInfinity<T, PackedT>();
+      continue;
+    }
+
+    if (remaining < kAlignment) {
+#pragma unroll
+      for (int i = 0; i < kAlignment; ++i) {
+        if (i < remaining && ((bitmask_val >> i) & 1)) {
+          logits_gmem_ptr[offset + i] = NegativeInfinity<T>();
+        }
+      }
       continue;
     }
 
@@ -180,7 +192,10 @@ void ApplyTokenBitmaskInplaceDispatchToPackedT(
 }
 
 void ApplyTokenBitmaskInplace(
-    at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt
+    at::Tensor logits,
+    at::Tensor bitmask,
+    c10::optional<int64_t> vocab_size = c10::nullopt,
+    at::optional<at::Tensor> indices = at::nullopt
 ) {
   TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor.");
   TORCH_CHECK(logits.dim() == 1 || logits.dim() == 2, "logits must be a 1D or 2D tensor.");
@@ -214,7 +229,17 @@ void ApplyTokenBitmaskInplace(
   TORCH_CHECK(logits.dim() == 1 or logits.stride(1) == 1, "logits's stride(1) must be 1");
   TORCH_CHECK(bitmask.dim() == 1 or bitmask.stride(1) == 1, "bitmask's stride(1) must be 1");
 
-  int vocab_size = std::min(logits_shape.second, bitmask_shape.second * BITS_PER_BLOCK);
+  int64_t detected_vocab_size = std::min<int64_t>(
+      logits_shape.second, static_cast<int64_t>(bitmask_shape.second) * BITS_PER_BLOCK
+  );
+  int64_t resolved_vocab_size = vocab_size.value_or(detected_vocab_size);
+  TORCH_CHECK(
+      resolved_vocab_size >= 0 && resolved_vocab_size <= detected_vocab_size,
+      "vocab_size must be between 0 and the detected vocab size ",
+      detected_vocab_size,
+      ", but got ",
+      resolved_vocab_size
+  );
 
   int32_t num_rows = logits_shape.first;
   int32_t* indices_ptr = nullptr;
@@ -238,7 +263,7 @@ void ApplyTokenBitmaskInplace(
           logits.data_ptr<float>(),
           bitmask.data_ptr<int32_t>(),
           indices_ptr,
-          vocab_size,
+          static_cast<int32_t>(resolved_vocab_size),
           logits.stride(0),
           bitmask.stride(0),
           num_rows
@@ -250,7 +275,7 @@ void ApplyTokenBitmaskInplace(
           reinterpret_cast<__half*>(logits.data_ptr<torch::Half>()),
           bitmask.data_ptr<int32_t>(),
           indices_ptr,
-          vocab_size,
+          static_cast<int32_t>(resolved_vocab_size),
           logits.stride(0),
           bitmask.stride(0),
           num_rows
@@ -262,7 +287,7 @@ void ApplyTokenBitmaskInplace(
           reinterpret_cast<__nv_bfloat16*>(logits.data_ptr<torch::BFloat16>()),
           bitmask.data_ptr<int32_t>(),
           indices_ptr,
-          vocab_size,
+          static_cast<int32_t>(resolved_vocab_size),
           logits.stride(0),
           bitmask.stride(0),
           num_rows
@@ -277,7 +302,7 @@ void ApplyTokenBitmaskInplace(
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def(
-      "apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, Tensor? indices=None) -> ()"
+      "apply_token_bitmask_inplace_cuda(Tensor logits, Tensor bitmask, int? vocab_size=None, Tensor? indices=None) -> ()"
   );
 }
 

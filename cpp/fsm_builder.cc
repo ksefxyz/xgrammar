@@ -150,7 +150,7 @@ class RegexIR {
 };
 
 Result<std::pair<int, int>> RegexIR::CheckRepeat(const std::string& regex, int& start) {
-  if (regex[start] != '{') {
+  if (static_cast<size_t>(start) >= regex.size() || regex[start] != '{') {
     return ResultErr("Invalid repeat format1");
   }
   int lower_bound = 0;
@@ -172,6 +172,9 @@ Result<std::pair<int, int>> RegexIR::CheckRepeat(const std::string& regex, int& 
   while (static_cast<size_t>(start) < regex.size() && regex[start] == ' ') {
     start++;
   }
+  if (static_cast<size_t>(start) >= regex.size()) {
+    return ResultErr("Invalid repeat format3");
+  }
   // The format is {n}
   if (regex[start] == '}') {
     upper_bound = lower_bound;
@@ -184,6 +187,9 @@ Result<std::pair<int, int>> RegexIR::CheckRepeat(const std::string& regex, int& 
   start++;
   while (static_cast<size_t>(start) < regex.size() && regex[start] == ' ') {
     start++;
+  }
+  if (static_cast<size_t>(start) >= regex.size()) {
+    return ResultErr("Invalid repeat format4");
   }
   // The format is {n,}
   if (regex[start] == '}') {
@@ -200,6 +206,9 @@ Result<std::pair<int, int>> RegexIR::CheckRepeat(const std::string& regex, int& 
   upper_bound = std::stoi(num_str);
   while (static_cast<size_t>(start) < regex.size() && regex[start] == ' ') {
     start++;
+  }
+  if (static_cast<size_t>(start) >= regex.size()) {
+    return ResultErr("Invalid repeat format5");
   }
   if (regex[start] != '}') {
     return ResultErr("Invalid repeat format5");
@@ -520,6 +529,7 @@ FSMWithStartEnd RegexIR::BuildLeafFSMFromRegex(const std::string& regex) {
 }
 
 std::vector<std::pair<int, int>> RegexIR::HandleEscapes(const std::string& regex, int start) {
+  XGRAMMAR_CHECK(start + 1 < static_cast<int>(regex.size())) << "Invalid escape sequence";
   std::vector<std::pair<int, int>> result;
   switch (regex[start + 1]) {
     case 'n': {

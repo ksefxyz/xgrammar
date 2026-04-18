@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 
+#include "support/recursion_guard.h"
 #include "support/thread_pool.h"
+#include "test_utils.h"
 using namespace xgrammar;
 
 TEST(XGramamrThreadPoolTest, FunctionalTest) {
@@ -35,6 +38,60 @@ TEST(XGramamrThreadPoolTest, FunctionalTest) {
 
   // Wait for task to complete
   pool.Join();
+}
+
+TEST(XGramamrThreadPoolTest, WaitRethrowsExecuteExceptionsAfterDrainingTasks) {
+  ThreadPool pool(2);
+  std::atomic<int> completed{0};
+
+  pool.Execute([&] { throw std::runtime_error("boom"); });
+  pool.Execute([&] { completed.fetch_add(1, std::memory_order_relaxed); });
+
+  XGRAMMAR_EXPECT_THROW(pool.Wait(), std::exception, "boom");
+  EXPECT_EQ(completed.load(std::memory_order_relaxed), 1);
+}
+
+TEST(XGramamrThreadPoolTest, WaitClearsStoredExceptionAfterRethrow) {
+  ThreadPool pool(1);
+  std::atomic<int> completed{0};
+
+  pool.Execute([] { throw std::runtime_error("boom once"); });
+  XGRAMMAR_EXPECT_THROW(pool.Wait(), std::exception, "boom once");
+
+  pool.Execute([&] { completed.fetch_add(1, std::memory_order_relaxed); });
+  EXPECT_NO_THROW(pool.Wait());
+  EXPECT_EQ(completed.load(std::memory_order_relaxed), 1);
+}
+
+TEST(XGramamrThreadPoolTest, JoinRethrowsExecuteExceptions) {
+  ThreadPool pool(1);
+
+  pool.Execute([] { throw std::runtime_error("join boom"); });
+
+  XGRAMMAR_EXPECT_THROW(pool.Join(), std::exception, "join boom");
+}
+
+TEST(XGramamrThreadPoolTest, ParallelForRejectsZeroThreadCountWhenWorkExists) {
+  XGRAMMAR_EXPECT_THROW(
+      ParallelFor(0, 2, 0, [](int) {}), std::exception, "num_threads must be positive"
+  );
+  EXPECT_NO_THROW(ParallelFor(0, 0, 0, [](int) {}));
+}
+
+TEST(XGrammarRecursionGuardTest, ConstructorRollbackOnThrow) {
+  int recursion_depth = 0;
+  int previous_max_depth = RecursionGuard::GetMaxRecursionDepth();
+  RecursionGuard::SetMaxRecursionDepth(1);
+
+  {
+    RecursionGuard outer(&recursion_depth);
+    EXPECT_EQ(recursion_depth, 1);
+    XGRAMMAR_EXPECT_THROW(RecursionGuard inner(&recursion_depth), std::exception, "Maximum recursion depth exceeded");
+    EXPECT_EQ(recursion_depth, 1);
+  }
+
+  EXPECT_EQ(recursion_depth, 0);
+  RecursionGuard::SetMaxRecursionDepth(previous_max_depth);
 }
 
 // TEST(XGramamrThreadPoolTest, PressureTest) {

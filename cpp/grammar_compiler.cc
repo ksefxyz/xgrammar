@@ -546,7 +546,8 @@ bool GrammarMatcherForTokenMaskCache::GetTokenMaskWithFirstCharacterCheck(
           for (char ch : token) {
             // If the first character is not the ascii character or can't be accepted by the
             // first character mask, we need to check them in the parser.
-            if (isascii(ch) == 0 || !speculative_mask[static_cast<uint8_t>(ch)]) {
+            const auto byte = static_cast<unsigned char>(ch);
+            if (byte >= 128 || !speculative_mask[byte]) {
               all_accepted = false;
               break;
             }
@@ -690,6 +691,23 @@ const std::vector<int32_t>& GrammarMatcherForTokenMaskCache::GetTokenEdgeAccepte
   const auto& tid_to_sorted = tokenizer_info_.ImplPtr()->GetTokenIdToSortedVocabIndex();
 
   bool has_exclude_token = false;
+  int32_t accepted_reserve = 0;
+  int32_t excluded_reserve = 0;
+
+  for (const auto& edge : edges) {
+    if (edge.IsToken()) {
+      accepted_reserve += fsm.GetFsm().GetTokenEdgeInfo(edge.GetAuxIndex()).Count();
+    } else if (edge.IsExcludeToken()) {
+      has_exclude_token = true;
+      excluded_reserve += fsm.GetFsm().GetExcludeTokenEdgeInfo(edge.GetAuxIndex()).Count();
+    }
+  }
+  if (accepted_reserve > 0) {
+    tmp_token_edge_accepted_.reserve(accepted_reserve);
+  }
+  if (excluded_reserve > 0) {
+    tmp_token_edge_excluded_.reserve(excluded_reserve);
+  }
 
   for (const auto& edge : edges) {
     if (edge.IsToken()) {
@@ -702,7 +720,6 @@ const std::vector<int32_t>& GrammarMatcherForTokenMaskCache::GetTokenEdgeAccepte
         }
       }
     } else if (edge.IsExcludeToken()) {
-      has_exclude_token = true;
       auto info = fsm.GetFsm().GetExcludeTokenEdgeInfo(edge.GetAuxIndex());
       for (int32_t i = 0; i < info.Count(); ++i) {
         int32_t tid = info.TokenIds()[i];
@@ -746,6 +763,8 @@ const std::vector<int32_t>& GrammarMatcherForTokenMaskCache::GetTokenEdgeAccepte
 }
 
 AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_root_rule) {
+  const int vocab_size = tokenizer_info_.GetVocabSize();
+  const auto& sorted_decoded_vocab = tokenizer_info_.GetSortedDecodedVocab();
   tmp_accepted_indices_.clear();
   tmp_rejected_indices_.clear();
   tmp_uncertain_indices_.clear();
@@ -767,8 +786,12 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   int lookahead_id = grammar_->GetRule(initial_state_.rule_id).lookahead_assertion_id;
   bool is_exact_lookahead = grammar_->GetRule(initial_state_.rule_id).is_exact_lookahead;
   std::optional<uint64_t> lookahead_hash = std::nullopt;
+  int cached_rule_fsm_num_states = 0;
+  int cached_rule_fsm_num_edges = 0;
   if (rule_level_cache_is_available) {
-    lookahead_hash = GrammarFSMHasher::HashSequence(grammar_, lookahead_id);
+    if (lookahead_id != -1) {
+      lookahead_hash = GrammarFSMHasher::HashSequence(grammar_, lookahead_id);
+    }
     const auto& original_to_new_id = grammar_->per_rule_fsm_new_state_ids[init_rule_id_];
     fsm_hash = grammar_->per_rule_fsm_hashes[init_rule_id_].value();
     for (const auto& original_new_pair : original_to_new_id) {
@@ -778,13 +801,15 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
       }
     }
     XGRAMMAR_DCHECK(new_state_id != -1);
-    const auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
+    const auto& cached_rule_fsm = grammar_->per_rule_fsms[init_rule_id_].value();
+    cached_rule_fsm_num_states = cached_rule_fsm.NumStates();
+    cached_rule_fsm_num_edges = cached_rule_fsm.GetNumEdges();
     if (lookahead_hash.has_value()) {
       crossing_cache = rule_level_cache_->GetCache(
           HashCombine(fsm_hash.value(), lookahead_hash.value(), is_exact_lookahead),
           new_state_id,
-          fsm.NumStates(),
-          fsm.GetNumEdges()
+          cached_rule_fsm_num_states,
+          cached_rule_fsm_num_edges
       );
       if (crossing_cache.has_value()) {
         // A perfect match.
@@ -792,7 +817,7 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
       }
     }
     crossing_cache = rule_level_cache_->GetCache(
-        fsm_hash.value(), new_state_id, fsm.NumStates(), fsm.GetNumEdges()
+        fsm_hash.value(), new_state_id, cached_rule_fsm_num_states, cached_rule_fsm_num_edges
     );
     // If the rule doesn't have a lookahead, then it is exactly the same fsm.
     if (crossing_cache.has_value()) {
@@ -828,18 +853,17 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
   }
   if (rejected_filled) {
     auto return_value = AdaptiveTokenMask(
-        tokenizer_info_.GetVocabSize(),
-        tokenizer_info_.GetSortedDecodedVocab(),
-        tmp_accepted_indices_,
-        tmp_rejected_indices_,
-        tmp_uncertain_indices_
+        vocab_size, sorted_decoded_vocab, tmp_accepted_indices_, tmp_rejected_indices_, tmp_uncertain_indices_
     );
     if (rule_level_cache_is_available) {
       if (lookahead_id == -1 && !is_root_rule) {
         // If the rule doesn't have a lookahead, then it is exactly the same fsm.
-        auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
         rule_level_cache_->AddCache(
-            fsm_hash.value(), new_state_id, fsm.NumStates(), fsm.GetNumEdges(), return_value
+            fsm_hash.value(),
+            new_state_id,
+            cached_rule_fsm_num_states,
+            cached_rule_fsm_num_edges,
+            return_value
         );
         return return_value;
       }
@@ -851,10 +875,14 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
       std::vector<int32_t> rejected_indices_without_lookahead;
       std::vector<int32_t> accepted_indices_without_lookahead;
       rejected_indices_without_lookahead.reserve(
-          tmp_rejected_indices_.size() - tmp_rejected_by_lookahead_indices_.size()
+          tmp_rejected_indices_.size() > tmp_rejected_by_lookahead_indices_.size()
+              ? tmp_rejected_indices_.size() - tmp_rejected_by_lookahead_indices_.size()
+              : 0
       );
       accepted_indices_without_lookahead.reserve(
-          tmp_accepted_indices_.size() - tmp_accepted_by_lookahead_indices_.size()
+          tmp_accepted_indices_.size() > tmp_accepted_by_lookahead_indices_.size()
+              ? tmp_accepted_indices_.size() - tmp_accepted_by_lookahead_indices_.size()
+              : 0
       );
       std::set_difference(
           tmp_rejected_indices_.begin(),
@@ -870,27 +898,25 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
           tmp_accepted_by_lookahead_indices_.end(),
           std::back_inserter(accepted_indices_without_lookahead)
       );
-      auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
       rule_level_cache_->AddCache(
           fsm_hash.value(),
           new_state_id,
-          fsm.NumStates(),
-          fsm.GetNumEdges(),
+          cached_rule_fsm_num_states,
+          cached_rule_fsm_num_edges,
           AdaptiveTokenMask(
-              tokenizer_info_.GetVocabSize(),
-              tokenizer_info_.GetSortedDecodedVocab(),
+              vocab_size,
+              sorted_decoded_vocab,
               accepted_indices_without_lookahead,
               rejected_indices_without_lookahead,
               tmp_uncertain_indices_
           )
       );
       if (lookahead_hash.has_value()) {
-        auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
         rule_level_cache_->AddCache(
             HashCombine(fsm_hash.value(), lookahead_hash.value(), is_exact_lookahead),
             new_state_id,
-            fsm.NumStates(),
-            fsm.GetNumEdges(),
+            cached_rule_fsm_num_states,
+            cached_rule_fsm_num_edges,
             return_value
         );
       }
@@ -898,19 +924,19 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
     return return_value;
   } else {
     auto return_value = AdaptiveTokenMask(
-        tokenizer_info_.GetVocabSize(),
-        tokenizer_info_.GetSortedDecodedVocab(),
-        tmp_accepted_indices_,
-        tmp_uncertain_indices_
+        vocab_size, sorted_decoded_vocab, tmp_accepted_indices_, tmp_uncertain_indices_
     );
 
     if (rule_level_cache_is_available) {
       // Prepare for cache.
-      auto& fsm = grammar_->per_rule_fsms[init_rule_id_].value();
       if (lookahead_id == -1 && !is_root_rule) {
         // If the rule doesn't have a lookahead, then it is exactly the same fsm.
         rule_level_cache_->AddCache(
-            fsm_hash.value(), new_state_id, fsm.NumStates(), fsm.GetNumEdges(), return_value
+            fsm_hash.value(),
+            new_state_id,
+            cached_rule_fsm_num_states,
+            cached_rule_fsm_num_edges,
+            return_value
         );
         return return_value;
       }
@@ -932,13 +958,10 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
       rule_level_cache_->AddCache(
           fsm_hash.value(),
           new_state_id,
-          fsm.NumStates(),
-          fsm.GetNumEdges(),
+          cached_rule_fsm_num_states,
+          cached_rule_fsm_num_edges,
           AdaptiveTokenMask(
-              tokenizer_info_.GetVocabSize(),
-              tokenizer_info_.GetSortedDecodedVocab(),
-              accepted_indices_without_lookahead,
-              tmp_uncertain_indices_
+              vocab_size, sorted_decoded_vocab, accepted_indices_without_lookahead, tmp_uncertain_indices_
           )
       );
 
@@ -946,8 +969,8 @@ AdaptiveTokenMask GrammarMatcherForTokenMaskCache::GetAdaptiveTokenMask(bool is_
         rule_level_cache_->AddCache(
             HashCombine(fsm_hash.value(), lookahead_hash.value(), is_exact_lookahead),
             new_state_id,
-            fsm.NumStates(),
-            fsm.GetNumEdges(),
+            cached_rule_fsm_num_states,
+            cached_rule_fsm_num_edges,
             return_value
         );
       }

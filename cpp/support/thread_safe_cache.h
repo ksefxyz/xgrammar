@@ -323,7 +323,7 @@ class ThreadSafeLRUCache {
       }
     }
 
-    auto task = std::packaged_task<SizedValue()>{[this, &key] {
+    auto task = std::packaged_task<SizedValue()>{[this, key] {
       auto value = computer_(key);
       auto result = SizedValue{value, size_estimator_(value)};
       current_size_ += result.size;
@@ -369,7 +369,7 @@ class ThreadSafeLRUCache {
       if (it != map.end()) return it->second.value;
     }
 
-    auto task = std::packaged_task<SizedValue()>{[this, &key] {
+    auto task = std::packaged_task<SizedValue()>{[this, key] {
       auto value = computer_(key);
       auto result = SizedValue{value, size_estimator_(value)};
       current_size_ += result.size;

@@ -72,9 +72,11 @@ class LogitsProcessor(transformers.LogitsProcessor):
                 if len(self.compiled_grammars) > 1
                 else self.compiled_grammars * self.batch_size
             )
-            assert (
-                len(self.compiled_grammars) == self.batch_size
-            ), "The number of compiled grammars must be equal to the batch size."
+            if len(self.compiled_grammars) != self.batch_size:
+                raise RuntimeError(
+                    "The number of compiled grammars must be equal to the batch size. "
+                    + f"Got {len(self.compiled_grammars)} grammars for batch size {self.batch_size}."
+                )
             self.matchers = [
                 xgr.GrammarMatcher(self.compiled_grammars[i]) for i in range(self.batch_size)
             ]
@@ -93,10 +95,15 @@ class LogitsProcessor(transformers.LogitsProcessor):
             for i in range(self.batch_size):
                 if not self.matchers[i].is_terminated():
                     sampled_token = input_ids[i][-1]
-                    assert self.matchers[i].accept_token(sampled_token)
+                    if not self.matchers[i].accept_token(sampled_token):
+                        raise RuntimeError(
+                            f"Sampled token {int(sampled_token)} is rejected by grammar matcher {i}."
+                        )
 
         for i in range(self.batch_size):
-            if not self.matchers[i].is_terminated():
+            if self.matchers[i].is_terminated():
+                self.token_bitmask[i].fill_(-1)
+            else:
                 self.matchers[i].fill_next_token_bitmask(self.token_bitmask, i)
 
         # We only support masking logits on CUDA or CPU

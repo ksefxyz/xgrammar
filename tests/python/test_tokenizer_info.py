@@ -220,6 +220,42 @@ def test_byte_fallback_decoder_accepts_lowercase_hex_digits():
     assert tokenizer_info.decoded_vocab == [b"\x1b", b"\xaf", b"\xaf"]
 
 
+def test_is_byte_level_tokenizer_does_not_depend_on_tiktoken(monkeypatch):
+    class _FakeTokenizer:
+        def encode(self, _text):
+            return [0]
+
+        def convert_ids_to_tokens(self, _ids):
+            return ["Ġ"]
+
+    monkeypatch.setattr(xgr.tokenizer_info, "tiktoken", None)
+
+    assert xgr.TokenizerInfo._is_byte_level_tokenizer(_FakeTokenizer()) is True
+
+
+def test_sentencepiece_processor_selection_matches_detection(monkeypatch):
+    class _FakeSentencePieceProcessor:
+        def eos_id(self):
+            return 7
+
+    class _FakeTokenizer:
+        sp_model = object()
+        tok = _FakeSentencePieceProcessor()
+
+        def get_vocab(self):
+            return {"a": 0}
+
+    monkeypatch.setattr(
+        xgr.tokenizer_info,
+        "sentencepiece",
+        type("_SentencePieceModule", (), {"SentencePieceProcessor": _FakeSentencePieceProcessor}),
+    )
+
+    tokenizer_info = xgr.TokenizerInfo.from_huggingface(_FakeTokenizer(), stop_token_ids=[1])
+
+    assert tokenizer_info.vocab_type == xgr.VocabType.RAW
+
+
 def test_byte_fallback_decoder_rejects_invalid_hex_digits():
     with pytest.raises(RuntimeError, match="Invalid hex digit in byte fallback token"):
         xgr.TokenizerInfo(["<0x1g>"], xgr.VocabType.BYTE_FALLBACK)

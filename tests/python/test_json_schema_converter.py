@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
@@ -671,6 +672,22 @@ def test_oneof_sibling_constraints_are_merged():
     )
 
 
+def test_integer_range_accepts_int64_min_boundary():
+    schema = {
+        "type": "integer",
+        "minimum": -9223372036854775808,
+        "maximum": -9223372036854775808,
+    }
+
+    check_schema_with_instance(schema, -9223372036854775808, any_whitespace=False)
+    check_schema_with_instance(schema, -9223372036854775807, is_accepted=False, any_whitespace=False)
+
+
+def test_generate_float_regex_rejects_values_at_int64_double_upper_bound():
+    with pytest.raises(RuntimeError, match="Number range exceeds int64 conversion limit"):
+        _generate_float_regex(None, float(1 << 63))
+
+
 def test_oneof_object_required_sets_are_exactly_one():
     schema = {
         "type": "object",
@@ -798,6 +815,189 @@ def test_oneof_object_required_and_not_branches_are_disjoint():
         is_accepted=False,
         any_whitespace=False,
     )
+
+
+def test_oneof_object_allof_required_sets_are_exactly_one():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+            "C": {"type": "integer"},
+        },
+        "oneOf": [
+            {"allOf": [{"required": ["A"]}, {"required": ["B"]}]},
+            {"required": ["C"]},
+        ],
+    }
+
+    check_schema_with_instance(schema, {"A": 1, "B": 2}, any_whitespace=False)
+    check_schema_with_instance(schema, {"C": 3}, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"A": 1, "B": 2, "C": 3}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_oneof_object_allof_required_and_none_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "P_6": {"type": "string"},
+            "OkresFa": {"type": "string"},
+        },
+        "oneOf": [
+            {
+                "allOf": [
+                    {"required": ["P_6"]},
+                    {"not": {"required": ["OkresFa"]}},
+                ]
+            },
+            {
+                "allOf": [
+                    {"required": ["OkresFa"]},
+                    {"not": {"required": ["P_6"]}},
+                ]
+            },
+            {
+                "not": {
+                    "anyOf": [
+                        {"required": ["P_6"]},
+                        {"required": ["OkresFa"]},
+                    ]
+                }
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {}, any_whitespace=False)
+    check_schema_with_instance(schema, {"P_6": "2026-01-01"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"OkresFa": "2026-01"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema,
+        {"P_6": "2026-01-01", "OkresFa": "2026-01"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_oneof_object_dependent_required_with_property_refinement():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Mode": {"enum": ["A", "B"]},
+            "X": {"type": "integer"},
+            "Y": {"type": "integer"},
+        },
+        "required": ["Mode"],
+        "oneOf": [
+            {
+                "properties": {"Mode": {"const": "A"}},
+                "dependentRequired": {"X": ["Y"]},
+            },
+            {
+                "properties": {"Mode": {"const": "B"}},
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {"Mode": "A"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "A", "X": 1, "Y": 2}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"Mode": "A", "X": 1}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"Mode": "B"}, any_whitespace=False)
+
+
+def test_oneof_object_allof_dependent_required_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Mode": {"enum": ["A", "B"]},
+            "X": {"type": "integer"},
+            "Y": {"type": "integer"},
+        },
+        "required": ["Mode"],
+        "oneOf": [
+            {
+                "allOf": [
+                    {"properties": {"Mode": {"const": "A"}}},
+                    {"dependentRequired": {"X": ["Y"]}},
+                ]
+            },
+            {
+                "allOf": [
+                    {"properties": {"Mode": {"const": "B"}}},
+                ]
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {"Mode": "A"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "A", "X": 1, "Y": 2}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"Mode": "A", "X": 1}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"Mode": "B"}, any_whitespace=False)
+
+
+def test_oneof_object_not_required_property_predicate_is_exactly_lowered():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Mode": {"enum": ["A", "B"]},
+        },
+        "required": ["Mode"],
+        "oneOf": [
+            {"properties": {"Mode": {"const": "A"}}},
+            {
+                "not": {
+                    "properties": {"Mode": {"const": "A"}},
+                    "required": ["Mode"],
+                }
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {"Mode": "A"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "B"}, any_whitespace=False)
+
+
+def test_oneof_object_not_anyof_mixed_required_and_property_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Mode": {"enum": ["A", "B"]},
+            "X": {"type": "integer"},
+        },
+        "required": ["Mode"],
+        "oneOf": [
+            {"properties": {"Mode": {"const": "A"}}},
+            {
+                "not": {
+                    "anyOf": [
+                        {
+                            "properties": {"Mode": {"const": "A"}},
+                            "required": ["Mode"],
+                        },
+                        {"required": ["X"]},
+                    ]
+                }
+            },
+            {
+                "required": ["X"],
+                "not": {
+                    "properties": {"Mode": {"const": "A"}},
+                    "required": ["Mode"],
+                },
+            },
+        ],
+    }
+
+    check_schema_with_instance(schema, {"Mode": "A"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "B"}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "B", "X": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {"Mode": "A", "X": 1}, any_whitespace=False)
 
 
 def test_oneof_overlapping_branches_raise():
@@ -1343,6 +1543,47 @@ def test_if_then_false_forbids_condition_match():
     check_schema_with_instance(schema, {"A": 1}, is_accepted=False, any_whitespace=False)
 
 
+def test_if_then_not_required_condition():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+            "B": {"type": "integer"},
+        },
+        "if": {"not": {"required": ["A"]}},
+        "then": {"required": ["B"]},
+    }
+
+    check_schema_with_instance(schema, {"B": 1}, any_whitespace=False)
+    check_schema_with_instance(schema, {}, is_accepted=False, any_whitespace=False)
+    check_schema_with_instance(schema, {"A": 1}, any_whitespace=False)
+
+
+def test_if_then_not_property_predicate():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR"]},
+            "Marker": {"type": "integer"},
+        },
+        "required": ["RodzajFaktury"],
+        "if": {
+            "not": {
+                "properties": {"RodzajFaktury": {"const": "VAT"}},
+            }
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR", "Marker": 1}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "UPR"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(schema, {"RodzajFaktury": "VAT"}, any_whitespace=False)
+
+
 def test_if_then_required_only_condition_requires_dependent_field():
     schema = {
         "type": "object",
@@ -1590,6 +1831,41 @@ def test_if_then_nested_object_property_path():
     )
 
 
+def test_if_then_nested_object_property_not_predicate():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Buyer": {
+                "type": "object",
+                "properties": {
+                    "NIP": {"type": "string"},
+                    "NrVatUE": {"type": "string"},
+                },
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Buyer": {
+                    "not": {"required": ["NIP"]},
+                }
+            },
+            "required": ["Buyer"],
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema, {"Buyer": {}, "Marker": 1}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Buyer": {}}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Buyer": {"NIP": "123"}}, any_whitespace=False
+    )
+
+
 def test_if_then_else_nested_object_property_path():
     schema = {
         "type": "object",
@@ -1786,6 +2062,26 @@ def test_if_property_predicate_requires_finite_sibling_domain():
     assert "direct sibling property definition with const or enum" in str(e.value)
 
 
+def test_if_unsupported_keyword_reports_context_and_hint():
+    schema = {
+        "type": "object",
+        "properties": {
+            "A": {"type": "integer"},
+        },
+        "if": {
+            "minimum": 1,
+        },
+        "then": {"required": ["A"]},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "At schema path #/if" in str(e.value)
+    assert 'if has unsupported keyword "minimum"' in str(e.value)
+    assert "Supported keys: type, required, properties, not, anyOf, allOf" in str(e.value)
+    assert "move this validation outside if/then/else" in str(e.value)
+
+
 def test_if_scalar_property_predicate_is_not_misclassified_as_nested_object():
     schema = {
         "type": "object",
@@ -1807,7 +2103,27 @@ def test_if_scalar_property_predicate_is_not_misclassified_as_nested_object():
 
     with pytest.raises(Exception) as e:
         xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "At schema path #/if/properties/X" in str(e.value)
     assert "if property predicates only support const or enum" in str(e.value)
+    assert 'found unsupported keyword "minimum"' in str(e.value)
+    assert 'if property "X"' in str(e.value)
+    assert "finite const/enum check" in str(e.value)
+
+
+def test_nested_property_schema_error_reports_json_pointer_path():
+    schema = {
+        "type": "object",
+        "properties": {
+            "X": {
+                "type": 123,
+            }
+        },
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "At schema path #/properties/X" in str(e.value)
+    assert "Type should be a string" in str(e.value)
 
 
 def test_if_then_array_contains_simple_item_discriminator():
@@ -1911,6 +2227,121 @@ def test_if_then_array_contains_uses_base_item_required():
     )
 
 
+def test_if_then_array_contains_nested_item_property_path():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "Meta": {
+                            "type": "object",
+                            "properties": {"Rola": {"enum": [8, 10]}},
+                            "required": ["Rola"],
+                        }
+                    },
+                    "required": ["Meta"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {
+                            "Meta": {
+                                "properties": {"Rola": {"const": 8}},
+                            }
+                        },
+                        "required": ["Meta"],
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Meta": {"Rola": 8}}], "JST": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Meta": {"Rola": 8}}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Meta": {"Rola": 10}}]},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_array_contains_item_anyof_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "NIP": {"type": "string"},
+                        "NrVatUE": {"type": "string"},
+                    },
+                },
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "anyOf": [
+                            {"required": ["NIP"]},
+                            {"required": ["NrVatUE"]},
+                        ],
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"NIP": "123"}], "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"NrVatUE": "PL123"}], "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{}]},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"NIP": "123"}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
 def test_if_then_else_array_contains_simple_item_discriminator():
     schema = {
         "type": "object",
@@ -1992,6 +2423,589 @@ def test_if_array_contains_requires_finite_item_domain():
     with pytest.raises(Exception) as e:
         xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
     assert "direct sibling item property definition with const or enum" in str(e.value)
+
+
+def test_if_array_predicate_unsupported_keyword_reports_context_and_hint():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                        "required": ["Rola"],
+                    },
+                    "maxContains": 1,
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    with pytest.raises(Exception) as e:
+        xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    assert "At schema path #/if/properties/Podmiot3" in str(e.value)
+    assert 'if array predicate for property "Podmiot3" has unsupported keyword "maxContains"' in str(
+        e.value
+    )
+    assert "Supported form is an array object with contains and optional minContains == 1" in str(
+        e.value
+    )
+    assert "move richer array logic outside if/then/else" in str(e.value)
+
+
+def test_array_allof_multiple_contains_predicates():
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+        "allOf": [
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                }
+            },
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 10}},
+                }
+            },
+        ],
+    }
+
+    check_schema_with_instance(
+        schema, [{"Rola": 8}, {"Rola": 10}], any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, [{"Rola": 8}, {"Rola": 10}, {"Rola": 10}], any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, [{"Rola": 8}], is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, [{"Rola": 10}], is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema,
+        '[{"Rola": 8}, {"Rola": 10}, ]',
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_array_duplicate_contains_predicates_share_subset_rule():
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+        "allOf": [
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                }
+            },
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                }
+            },
+        ],
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    contains_subset_rules = [
+        line
+        for line in grammar_ebnf.splitlines()
+        if "::=" in line
+        and re.fullmatch(r".*_contains_subset_\d+", line.split(" ::=", 1)[0])
+    ]
+    assert len(contains_subset_rules) == 1
+    contains_sequence_rules = [
+        line
+        for line in grammar_ebnf.splitlines()
+        if "::=" in line
+        and re.fullmatch(r".*_contains_seq(?:_\d+)?", line.split(" ::=", 1)[0])
+    ]
+    for line in contains_sequence_rules:
+        alternatives = [alt.strip() for alt in line.split("::=", 1)[1].split("|")]
+        assert len(alternatives) == len(set(alternatives))
+    check_schema_with_instance(schema, [{"Rola": 8}], any_whitespace=False)
+    check_schema_with_instance(schema, [{"Rola": 10}], is_accepted=False, any_whitespace=False)
+
+
+def test_array_semantically_equivalent_contains_predicates_are_deduplicated():
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+        "allOf": [
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                    "required": ["Rola"],
+                }
+            },
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                }
+            },
+        ],
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    contains_subset_rules = [
+        line
+        for line in grammar_ebnf.splitlines()
+        if "::=" in line
+        and re.fullmatch(r".*_contains_subset_\d+", line.split(" ::=", 1)[0])
+    ]
+    assert len(contains_subset_rules) == 1
+    check_schema_with_instance(schema, [{"Rola": 8}], any_whitespace=False)
+    check_schema_with_instance(schema, [{"Rola": 10}], is_accepted=False, any_whitespace=False)
+
+
+def test_array_contains_equivalent_to_items_collapses_to_min_items():
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+        "contains": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    assert "_contains_seq" not in grammar_ebnf
+    check_schema_with_instance(schema, [{"Rola": 8}], any_whitespace=False)
+    check_schema_with_instance(schema, [{"Rola": 10}], any_whitespace=False)
+    check_schema_with_instance(schema, [], is_accepted=False, any_whitespace=False)
+
+
+def test_array_subsumed_contains_predicate_is_pruned():
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"Rola": {"enum": [8, 10]}},
+            "required": ["Rola"],
+        },
+        "allOf": [
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                }
+            },
+            {
+                "contains": {
+                    "type": "object",
+                    "properties": {"Rola": {"const": 8}},
+                }
+            },
+        ],
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    contains_subset_rules = [
+        line
+        for line in grammar_ebnf.splitlines()
+        if "::=" in line
+        and re.fullmatch(r".*_contains_subset_\d+", line.split(" ::=", 1)[0])
+    ]
+    assert len(contains_subset_rules) == 1
+    check_schema_with_instance(schema, [{"Rola": 8}], any_whitespace=False)
+    check_schema_with_instance(schema, [{"Rola": 10}], is_accepted=False, any_whitespace=False)
+
+
+def test_if_then_anyof_local_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR", "ZAL"]},
+            "BuyerType": {"enum": ["DOM", "UE"]},
+            "Marker": {"type": "integer"},
+        },
+        "required": ["RodzajFaktury"],
+        "if": {
+            "anyOf": [
+                {"properties": {"RodzajFaktury": {"const": "VAT"}}},
+                {
+                    "properties": {"BuyerType": {"const": "UE"}},
+                    "required": ["BuyerType"],
+                },
+            ]
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT", "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "ZAL", "BuyerType": "UE", "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "ZAL", "BuyerType": "DOM"},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_anyof_duplicate_predicates_are_deduplicated():
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"enum": ["A", "B"]},
+            "a": {"type": "string"},
+        },
+        "required": ["kind"],
+        "if": {
+            "anyOf": [
+                {"properties": {"kind": {"const": "A"}}},
+                {"properties": {"kind": {"const": "A"}}},
+            ]
+        },
+        "then": {"required": ["a"]},
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    root_line = next(line for line in grammar_ebnf.splitlines() if line.startswith("root ::="))
+    alternatives = [alt.strip() for alt in root_line[len("root ::=") :].split("|")]
+    assert len(alternatives) == len(set(alternatives)) == 2
+
+
+def test_if_then_impossible_nested_allof_condition_collapses_to_base_branch():
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"enum": ["VAT"], "const": "VAT"},
+            "P_2": {"type": "string"},
+            "FaWiersz": {"type": "string"},
+        },
+        "required": ["kind", "P_2"],
+        "if": {
+            "allOf": [
+                {"properties": {"kind": {"const": "UPR"}}, "required": ["kind"]},
+                {"required": ["kind"]},
+            ]
+        },
+        "then": {"required": ["FaWiersz"]},
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    root_line = next(line for line in grammar_ebnf.splitlines() if line.startswith("root ::="))
+    assert "|" not in root_line
+    assert '"UPR"' not in grammar_ebnf
+
+
+def test_if_then_enum_predicate_is_intersected_with_base_domain():
+    schema = {
+        "type": "object",
+        "properties": {
+            "kind": {"enum": ["A", "B"]},
+            "a": {"type": "string"},
+        },
+        "required": ["kind"],
+        "if": {"properties": {"kind": {"enum": ["A", "X"]}}},
+        "then": {"required": ["a"]},
+    }
+
+    grammar_ebnf = _json_schema_to_ebnf(schema, any_whitespace=False)
+    assert '"X"' not in grammar_ebnf
+
+
+def test_object_anyof_required_only_fragments_merge_with_base_properties():
+    schema = {
+        "type": "object",
+        "properties": {
+            "NIP": {"type": "string"},
+            "NrVatUE": {"type": "string"},
+        },
+        "anyOf": [
+            {"required": ["NIP"]},
+            {"required": ["NrVatUE"]},
+        ],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"NIP": "123"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"NrVatUE": "PL123"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"NIP": "123", "NrVatUE": "PL123"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+
+
+def test_if_then_allof_local_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR", "ZAL"]},
+            "BuyerType": {"enum": ["DOM", "UE"]},
+            "Marker": {"type": "integer"},
+        },
+        "required": ["RodzajFaktury", "BuyerType"],
+        "if": {
+            "allOf": [
+                {"properties": {"RodzajFaktury": {"const": "VAT"}}},
+                {"properties": {"BuyerType": {"const": "UE"}}},
+            ]
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT", "BuyerType": "UE", "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT", "BuyerType": "UE"},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT", "BuyerType": "DOM"},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "ZAL", "BuyerType": "UE"},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_anyof_mixed_contains_and_property_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "RodzajFaktury": {"enum": ["VAT", "UPR"]},
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                    "required": ["Rola"],
+                },
+            },
+            "JST": {"type": "integer"},
+        },
+        "required": ["RodzajFaktury"],
+        "if": {
+            "anyOf": [
+                {"properties": {"RodzajFaktury": {"const": "VAT"}}},
+                {
+                    "properties": {
+                        "Podmiot3": {
+                            "type": "array",
+                            "contains": {
+                                "type": "object",
+                                "properties": {"Rola": {"const": 8}},
+                            },
+                        }
+                    },
+                    "required": ["Podmiot3"],
+                },
+            ]
+        },
+        "then": {"required": ["JST"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "VAT", "JST": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "UPR", "Podmiot3": [{"Rola": 8}], "JST": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "UPR", "Podmiot3": [{"Rola": 8}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"RodzajFaktury": "UPR", "Podmiot3": [{"Rola": 10}]},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_allof_same_array_multiple_contains_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                    "required": ["Rola"],
+                },
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "allOf": [
+                {
+                    "properties": {
+                        "Podmiot3": {
+                            "type": "array",
+                            "contains": {
+                                "type": "object",
+                                "properties": {"Rola": {"const": 8}},
+                            },
+                        }
+                    },
+                    "required": ["Podmiot3"],
+                },
+                {
+                    "properties": {
+                        "Podmiot3": {
+                            "type": "array",
+                            "contains": {
+                                "type": "object",
+                                "properties": {"Rola": {"const": 10}},
+                            },
+                        }
+                    },
+                    "required": ["Podmiot3"],
+                },
+            ]
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}, {"Rola": 10}], "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}, {"Rola": 10}]},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Podmiot3": [{"Rola": 8}]},
+        any_whitespace=False,
+    )
+
+
+def test_if_then_nested_property_anyof_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Buyer": {
+                "type": "object",
+                "properties": {
+                    "NIP": {"type": "string"},
+                    "NrVatUE": {"type": "string"},
+                },
+            },
+            "Marker": {"type": "integer"},
+        },
+        "if": {
+            "properties": {
+                "Buyer": {
+                    "anyOf": [
+                        {"required": ["NIP"]},
+                        {"required": ["NrVatUE"]},
+                    ]
+                }
+            },
+            "required": ["Buyer"],
+        },
+        "then": {"required": ["Marker"]},
+    }
+
+    check_schema_with_instance(
+        schema,
+        {"Buyer": {"NIP": "123"}, "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Buyer": {"NrVatUE": "PL123"}, "Marker": 1},
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Buyer": {"NIP": "123"}},
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {"Buyer": {}},
+        any_whitespace=False,
+    )
 
 
 def test_dependent_schemas_required_fragment():
@@ -2259,24 +3273,126 @@ def test_not_empty_required_is_unsatisfiable():
     assert "object presence constraints have no satisfiable assignments" in str(e.value)
 
 
-
-
-def test_not_unsupported_object_pattern_raises():
+def test_not_property_predicate_supported():
     schema = {
         "type": "object",
         "properties": {
-            "A": {"type": "integer"},
+            "RodzajFaktury": {"enum": ["VAT", "UPR"]},
         },
+        "required": ["RodzajFaktury"],
+        "not": {"properties": {"RodzajFaktury": {"const": "VAT"}}},
+    }
+
+    check_schema_with_instance(schema, {"RodzajFaktury": "UPR"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"RodzajFaktury": "VAT"}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_anyof_mixed_required_and_property_predicates():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Mode": {"enum": ["A", "B"]},
+            "X": {"type": "integer"},
+        },
+        "required": ["Mode"],
+        "not": {
+            "anyOf": [
+                {
+                    "properties": {"Mode": {"const": "A"}},
+                    "required": ["Mode"],
+                },
+                {"required": ["X"]},
+            ]
+        },
+    }
+
+    check_schema_with_instance(schema, {"Mode": "B"}, any_whitespace=False)
+    check_schema_with_instance(
+        schema, {"Mode": "A"}, is_accepted=False, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Mode": "B", "X": 1}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_nested_property_predicate_supported():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Buyer": {
+                "type": "object",
+                "properties": {
+                    "Type": {"enum": ["DOM", "UE"]},
+                },
+                "required": ["Type"],
+            }
+        },
+        "required": ["Buyer"],
         "not": {
             "properties": {
-                "A": {"const": 1},
+                "Buyer": {
+                    "properties": {"Type": {"const": "UE"}},
+                    "required": ["Type"],
+                }
             }
         },
     }
 
+    check_schema_with_instance(
+        schema, {"Buyer": {"Type": "DOM"}}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Buyer": {"Type": "UE"}}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_array_contains_predicate_supported():
+    schema = {
+        "type": "object",
+        "properties": {
+            "Podmiot3": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"Rola": {"enum": [8, 10]}},
+                    "required": ["Rola"],
+                },
+            }
+        },
+        "not": {
+            "properties": {
+                "Podmiot3": {
+                    "type": "array",
+                    "contains": {
+                        "type": "object",
+                        "properties": {"Rola": {"const": 8}},
+                    },
+                }
+            },
+            "required": ["Podmiot3"],
+        },
+    }
+
+    check_schema_with_instance(
+        schema, {"Podmiot3": [{"Rola": 10}]}, any_whitespace=False
+    )
+    check_schema_with_instance(
+        schema, {"Podmiot3": [{"Rola": 8}]}, is_accepted=False, any_whitespace=False
+    )
+
+
+def test_not_non_object_schema_is_not_rewritten_as_conditional():
+    schema = {
+        "not": {
+            "minimum": 5,
+        }
+    }
+
     with pytest.raises(Exception) as e:
         xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
-    assert "object not only supports required or anyOf of required groups" in str(e.value)
+    assert 'unsupported keyword "minimum"' not in str(e.value)
 
 
 def test_object_presence_constraints_preserve_unrelated_required_fields():

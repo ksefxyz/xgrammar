@@ -1232,6 +1232,22 @@ def test_stag_exclude_token_with_string_excludes():
     _accept_and_stop(m, [4])  # <end>
 
 
+def test_stag_repeat_resolves_string_token_refs():
+    stag = {
+        "type": "structural_tag",
+        "format": {
+            "type": "repeat",
+            "min": 1,
+            "max": 2,
+            "content": {"type": "token", "token": "<tool>"},
+        },
+    }
+    m, b, ti = _stag_matcher(stag)
+    _accept_tokens(m, [2])
+    assert m.accept_token(STAG_STOP)
+    assert m.is_terminated()
+
+
 def test_stag_token_triggered_string_token_refs():
     """TokenTriggeredTags using string references for trigger_tokens and exclude_tokens."""
     stag = {
@@ -1297,6 +1313,15 @@ def test_stag_tag_with_sequence_content_mixed():
     assert not m.accept_token(16)  # <bad> excluded in any_tokens
     _accept_tokens(m, [8, 14, 5])  # world y <think> (any_tokens loop)
     _accept_and_stop(m, [4])  # <end>
+
+
+def test_find_jump_forward_string_stops_when_token_edge_also_matches():
+    vocab = ["<s>", "</s>", "xyz"]
+    tokenizer_info = xgr.TokenizerInfo(vocab)
+    grammar = xgr.Grammar.from_ebnf('root ::= "a" | Token(2)\n')
+    matcher = _get_matcher_from_grammar_and_tokenizer_info(grammar, tokenizer_info)
+
+    assert matcher.find_jump_forward_string() == ""
 
 
 def test_stag_or_between_token_triggered_and_string_triggered():

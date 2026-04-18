@@ -90,6 +90,11 @@ GrammarMatcher GrammarMatcher_Init(
   );
 }
 
+struct GrammarMatcherBitmaskResult {
+  bool needsMasking;
+  std::vector<int> bitmask;
+};
+
 /*!
  * \brief Finds the next token bitmask of the matcher.
  */
@@ -111,6 +116,26 @@ std::vector<int32_t> GrammarMatcher_GetNextTokenBitmask(GrammarMatcher& matcher,
   // 3. Populate tensor, hence result
   matcher.FillNextTokenBitmask(&tensor);
   return result;
+}
+
+GrammarMatcherBitmaskResult GrammarMatcher_GetNextTokenBitmaskWithStatus(
+    GrammarMatcher& matcher, int vocab_size
+) {
+  auto buffer_size = GetBitmaskSize(vocab_size);
+  std::vector<int> result(buffer_size);
+  DLTensor tensor;
+  tensor.data = result.data();
+  tensor.device = DLDevice{kDLCPU, 0};
+  tensor.ndim = 1;
+  tensor.dtype = DLDataType{kDLInt, 32, 1};
+  std::vector<int64_t> shape = {buffer_size};
+  tensor.shape = &shape[0];
+  std::vector<int64_t> strides = {1};
+  tensor.strides = &strides[0];
+  tensor.byte_offset = 0;
+
+  bool needs_masking = matcher.FillNextTokenBitmask(&tensor);
+  return GrammarMatcherBitmaskResult{needs_masking, std::move(result)};
 }
 
 /*!
@@ -156,7 +181,8 @@ EMSCRIPTEN_BINDINGS(xgrammar) {
       .value("kJSON", xgrammar::JSONFormat::kJSON)
       .value("kQwenXML", xgrammar::JSONFormat::kQwenXML)
       .value("kMiniMaxXML", xgrammar::JSONFormat::kMiniMaxXML)
-      .value("kDeepSeekXML", xgrammar::JSONFormat::kDeepSeekXML);
+      .value("kDeepSeekXML", xgrammar::JSONFormat::kDeepSeekXML)
+      .value("kGlmXML", xgrammar::JSONFormat::kGlmXML);
 
   // Register std::optional used in Grammar::FromJSONSchema
   register_optional<int>();
@@ -175,6 +201,9 @@ EMSCRIPTEN_BINDINGS(xgrammar) {
   // Register std::optional<std::vector<int>> for GrammarMatcher_Init
   register_vector<int>("VectorInt");
   register_optional<std::vector<int>>();
+  value_object<GrammarMatcherBitmaskResult>("GrammarMatcherBitmaskResult")
+      .field("needsMasking", &GrammarMatcherBitmaskResult::needsMasking)
+      .field("bitmask", &GrammarMatcherBitmaskResult::bitmask);
   function(
       "vecIntFromJSArray",
       select_overload<std::vector<int>(const emscripten::val&)>(&VecIntFromJSArray)
@@ -232,6 +261,7 @@ EMSCRIPTEN_BINDINGS(xgrammar) {
       .function("GetMaxRollbackTokens", &GrammarMatcher::GetMaxRollbackTokens)
       .function("AcceptToken", &GrammarMatcher::AcceptToken)
       .function("GetNextTokenBitmask", &GrammarMatcher_GetNextTokenBitmask)
+      .function("GetNextTokenBitmaskWithStatus", &GrammarMatcher_GetNextTokenBitmaskWithStatus)
       .function("IsTerminated", &GrammarMatcher::IsTerminated)
       .function("IsCompleted", &GrammarMatcher::IsCompleted)
       .function("Reset", &GrammarMatcher::Reset)

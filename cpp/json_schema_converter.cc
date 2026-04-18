@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <initializer_list>
 #include <functional>
 #include <limits>
 #include <sstream>
@@ -28,6 +29,262 @@
 #include "support/utils.h"
 
 namespace xgrammar {
+
+namespace {
+
+const std::unordered_set<std::string>& IgnoredSchemaAnnotationKeys() {
+  static const std::unordered_set<std::string> keys = {
+      "title",
+      "default",
+      "description",
+      "examples",
+      "deprecated",
+      "readOnly",
+      "writeOnly",
+      "$comment",
+  };
+  return keys;
+}
+
+std::string StructuralSchemaKey(const SchemaSpecPtr& schema);
+
+std::string FormatOptionalInt(const std::optional<int64_t>& value) {
+  return value.has_value() ? std::to_string(*value) : "null";
+}
+
+std::string FormatOptionalDouble(const std::optional<double>& value) {
+  if (!value.has_value()) {
+    return "null";
+  }
+  std::ostringstream os;
+  os << std::setprecision(17) << *value;
+  return os.str();
+}
+
+template <typename T>
+std::string JoinVector(
+    const std::vector<T>& values, const std::function<std::string(const T&)>& to_string
+) {
+  std::string result = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      result += ",";
+    }
+    result += to_string(values[i]);
+  }
+  result += "]";
+  return result;
+}
+
+std::string JoinSortedStrings(const std::unordered_set<std::string>& values) {
+  std::vector<std::string> sorted(values.begin(), values.end());
+  std::sort(sorted.begin(), sorted.end());
+  return JoinVector<std::string>(sorted, [](const std::string& value) { return value; });
+}
+
+std::string StructuralSchemaKey(const SchemaSpecPtr& schema) {
+  return std::visit(
+      [](const auto& spec) -> std::string {
+        using T = std::decay_t<decltype(spec)>;
+        if constexpr (std::is_same_v<T, IntegerSpec>) {
+          return "Integer(" + FormatOptionalInt(spec.minimum) + "," +
+                 FormatOptionalInt(spec.maximum) + "," +
+                 FormatOptionalInt(spec.exclusive_minimum) + "," +
+                 FormatOptionalInt(spec.exclusive_maximum) + ")";
+        } else if constexpr (std::is_same_v<T, NumberSpec>) {
+          return "Number(" + FormatOptionalDouble(spec.minimum) + "," +
+                 FormatOptionalDouble(spec.maximum) + "," +
+                 FormatOptionalDouble(spec.exclusive_minimum) + "," +
+                 FormatOptionalDouble(spec.exclusive_maximum) + ")";
+        } else if constexpr (std::is_same_v<T, StringSpec>) {
+          return "String(" + (spec.pattern.has_value() ? *spec.pattern : "null") + "," +
+                 (spec.format.has_value() ? *spec.format : "null") + "," +
+                 std::to_string(spec.min_length) + "," + std::to_string(spec.max_length) + ")";
+        } else if constexpr (std::is_same_v<T, BooleanSpec>) {
+          return "Boolean";
+        } else if constexpr (std::is_same_v<T, NullSpec>) {
+          return "Null";
+        } else if constexpr (std::is_same_v<T, AnySpec>) {
+          return "Any";
+        } else if constexpr (std::is_same_v<T, ConstSpec>) {
+          return "Const(" + spec.json_value + ")";
+        } else if constexpr (std::is_same_v<T, EnumSpec>) {
+          auto json_values = spec.json_values;
+          std::sort(json_values.begin(), json_values.end());
+          return "Enum" + JoinVector<std::string>(json_values, [](const std::string& value) {
+                   return value;
+                 });
+        } else if constexpr (std::is_same_v<T, RefSpec>) {
+          return "Ref(" + spec.uri + ")";
+        } else if constexpr (std::is_same_v<T, AnyOfSpec>) {
+          std::vector<std::string> option_keys;
+          option_keys.reserve(spec.options.size());
+          for (const auto& option : spec.options) {
+            option_keys.push_back(StructuralSchemaKey(option));
+          }
+          std::sort(option_keys.begin(), option_keys.end());
+          return "AnyOf" +
+                 JoinVector<std::string>(option_keys, [](const std::string& value) {
+                   return value;
+                 });
+        } else if constexpr (std::is_same_v<T, OneOfSpec>) {
+          std::vector<std::string> option_keys;
+          option_keys.reserve(spec.options.size());
+          for (const auto& option : spec.options) {
+            option_keys.push_back(StructuralSchemaKey(option));
+          }
+          std::sort(option_keys.begin(), option_keys.end());
+          return "OneOf" +
+                 JoinVector<std::string>(option_keys, [](const std::string& value) {
+                   return value;
+                 });
+        } else if constexpr (std::is_same_v<T, AllOfSpec>) {
+          std::vector<std::string> schema_keys;
+          schema_keys.reserve(spec.schemas.size());
+          for (const auto& child : spec.schemas) {
+            schema_keys.push_back(StructuralSchemaKey(child));
+          }
+          std::sort(schema_keys.begin(), schema_keys.end());
+          return "AllOf" +
+                 JoinVector<std::string>(schema_keys, [](const std::string& value) {
+                   return value;
+                 });
+        } else if constexpr (std::is_same_v<T, TypeArraySpec>) {
+          std::vector<std::string> type_keys;
+          type_keys.reserve(spec.type_schemas.size());
+          for (const auto& child : spec.type_schemas) {
+            type_keys.push_back(StructuralSchemaKey(child));
+          }
+          std::sort(type_keys.begin(), type_keys.end());
+          return "TypeArray" +
+                 JoinVector<std::string>(type_keys, [](const std::string& value) {
+                   return value;
+                 });
+        } else if constexpr (std::is_same_v<T, ArraySpec>) {
+          std::vector<std::string> prefix_keys;
+          prefix_keys.reserve(spec.prefix_items.size());
+          for (const auto& child : spec.prefix_items) {
+            prefix_keys.push_back(StructuralSchemaKey(child));
+          }
+          std::vector<std::string> contains_keys;
+          contains_keys.reserve(spec.contains_items.size());
+          for (const auto& child : spec.contains_items) {
+            contains_keys.push_back(StructuralSchemaKey(child));
+          }
+          std::sort(contains_keys.begin(), contains_keys.end());
+          return "Array(prefix=" +
+                 JoinVector<std::string>(prefix_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",allow_additional=" + std::string(spec.allow_additional_items ? "1" : "0") +
+                 ",additional=" +
+                 (spec.additional_items ? StructuralSchemaKey(spec.additional_items) : "null") +
+                 ",contains=" +
+                 JoinVector<std::string>(contains_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",min_contains=" + std::to_string(spec.min_contains) +
+                 ",min_items=" + std::to_string(spec.min_items) +
+                 ",max_items=" + std::to_string(spec.max_items) + ")";
+        } else if constexpr (std::is_same_v<T, ObjectSpec>) {
+          std::vector<std::string> property_keys;
+          property_keys.reserve(spec.properties.size());
+          for (const auto& property : spec.properties) {
+            property_keys.push_back(property.name + ":" + StructuralSchemaKey(property.schema));
+          }
+          std::sort(property_keys.begin(), property_keys.end());
+          std::vector<std::string> pattern_property_keys;
+          pattern_property_keys.reserve(spec.pattern_properties.size());
+          for (const auto& pattern_property : spec.pattern_properties) {
+            pattern_property_keys.push_back(
+                pattern_property.pattern + ":" + StructuralSchemaKey(pattern_property.schema)
+            );
+          }
+          std::sort(pattern_property_keys.begin(), pattern_property_keys.end());
+          std::vector<std::string> dependent_required_keys;
+          dependent_required_keys.reserve(spec.dependent_required.size());
+          for (const auto& [name, required_values] : spec.dependent_required) {
+            auto sorted_required = required_values;
+            std::sort(sorted_required.begin(), sorted_required.end());
+            dependent_required_keys.push_back(
+                name + ":" +
+                JoinVector<std::string>(sorted_required, [](const std::string& value) {
+                  return value;
+                })
+            );
+          }
+          std::sort(dependent_required_keys.begin(), dependent_required_keys.end());
+          std::vector<std::string> forbidden_group_keys;
+          forbidden_group_keys.reserve(spec.forbidden_groups.size());
+          for (const auto& forbidden_group : spec.forbidden_groups) {
+            auto sorted_group = forbidden_group;
+            std::sort(sorted_group.begin(), sorted_group.end());
+            forbidden_group_keys.push_back(
+                JoinVector<std::string>(sorted_group, [](const std::string& value) {
+                  return value;
+                })
+            );
+          }
+          std::sort(forbidden_group_keys.begin(), forbidden_group_keys.end());
+          std::vector<std::string> forbidden_property_value_keys;
+          forbidden_property_value_keys.reserve(spec.forbidden_property_values.size());
+          for (const auto& [name, values] : spec.forbidden_property_values) {
+            auto sorted_values = values;
+            std::sort(sorted_values.begin(), sorted_values.end());
+            forbidden_property_value_keys.push_back(
+                name + ":" +
+                JoinVector<std::string>(sorted_values, [](const std::string& value) {
+                  return value;
+                })
+            );
+          }
+          std::sort(forbidden_property_value_keys.begin(), forbidden_property_value_keys.end());
+          return "Object(properties=" +
+                 JoinVector<std::string>(property_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",pattern_properties=" +
+                 JoinVector<std::string>(pattern_property_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",required=" + JoinSortedStrings(spec.required) +
+                 ",dependent_required=" +
+                 JoinVector<std::string>(dependent_required_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",forbidden_groups=" +
+                 JoinVector<std::string>(forbidden_group_keys, [](const std::string& value) {
+                   return value;
+                 }) +
+                 ",forbidden_property_values=" +
+                 JoinVector<std::string>(
+                     forbidden_property_value_keys, [](const std::string& value) { return value; }
+                 ) +
+                 ",allow_additional=" +
+                 std::string(spec.allow_additional_properties ? "1" : "0") + ",additional=" +
+                 (spec.additional_properties_schema
+                      ? StructuralSchemaKey(spec.additional_properties_schema)
+                      : "null") +
+                 ",allow_unevaluated=" +
+                 std::string(spec.allow_unevaluated_properties ? "1" : "0") +
+                 ",unevaluated=" +
+                 (spec.unevaluated_properties_schema
+                      ? StructuralSchemaKey(spec.unevaluated_properties_schema)
+                      : "null") +
+                 ",property_names=" +
+                 (spec.property_names ? StructuralSchemaKey(spec.property_names) : "null") +
+                 ",min_properties=" + std::to_string(spec.min_properties) +
+                 ",max_properties=" + std::to_string(spec.max_properties) + ")";
+        } else {
+          XGRAMMAR_LOG(FATAL) << "Unknown spec type";
+          return "";
+        }
+      },
+      schema->spec
+  );
+}
+
+}  // namespace
 
 // ==================== Spec ToString implementations ====================
 
@@ -66,7 +323,8 @@ std::string ArraySpec::ToString() const {
   return "ArraySpec{prefix_items.size()=" + std::to_string(prefix_items.size()) +
          ", allow_additional_items=" + (allow_additional_items ? "true" : "false") +
          ", additional_items=" + (additional_items ? "SchemaSpec" : "null") +
-         ", contains_item=" + (contains_item ? "SchemaSpec" : "null") +
+         ", contains_items.size()=" + std::to_string(contains_items.size()) +
+         ", contains_subsets.size()=" + std::to_string(contains_subsets.size()) +
          ", min_contains=" + std::to_string(min_contains) +
          ", min_items=" + std::to_string(min_items) + ", max_items=" + std::to_string(max_items) +
          "}";
@@ -87,7 +345,8 @@ std::string ObjectSpec::ToString() const {
     first = false;
   }
   s += "], dependent_required.size()=" + std::to_string(dependent_required.size()) +
-       ", forbidden_groups.size()=" + std::to_string(forbidden_groups.size());
+       ", forbidden_groups.size()=" + std::to_string(forbidden_groups.size()) +
+       ", forbidden_property_values.size()=" + std::to_string(forbidden_property_values.size());
   s +=
       std::string(", allow_additional_properties=") +
       (allow_additional_properties ? "true" : "false") +
@@ -149,6 +408,116 @@ enum class SchemaErrorType : int {
 
 using SchemaError = TypedError<SchemaErrorType>;
 
+template <typename T>
+bool PushBackUnique(std::vector<T>* values, T value) {
+  if (std::find(values->begin(), values->end(), value) != values->end()) {
+    return false;
+  }
+  values->push_back(std::move(value));
+  return true;
+}
+
+using FragmentList = std::vector<picojson::value>;
+using FragmentAlternatives = std::vector<FragmentList>;
+
+struct ConditionAlternatives {
+  FragmentAlternatives positive_alternatives;
+  FragmentAlternatives negative_alternatives;
+};
+
+class FragmentAlternativeOps {
+ public:
+  explicit FragmentAlternativeOps(std::function<std::string(const picojson::value&)> compute_cache_key)
+      : compute_cache_key_(std::move(compute_cache_key)) {}
+
+  FragmentAlternatives MakeEmpty() const { return {FragmentList{}}; }
+
+  FragmentList Canonicalize(FragmentList fragments) const {
+    std::vector<std::pair<std::string, picojson::value>> keyed_fragments;
+    keyed_fragments.reserve(fragments.size());
+    for (auto& fragment : fragments) {
+      keyed_fragments.emplace_back(compute_cache_key_(fragment), std::move(fragment));
+    }
+    std::sort(
+        keyed_fragments.begin(),
+        keyed_fragments.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; }
+    );
+    FragmentList normalized;
+    std::string last_key;
+    bool has_last_key = false;
+    for (auto& keyed_fragment : keyed_fragments) {
+      if (has_last_key && keyed_fragment.first == last_key) {
+        continue;
+      }
+      last_key = keyed_fragment.first;
+      has_last_key = true;
+      normalized.push_back(std::move(keyed_fragment.second));
+    }
+    return normalized;
+  }
+
+  FragmentAlternatives Dedup(FragmentAlternatives alternatives) const {
+    FragmentAlternatives deduped;
+    std::unordered_set<std::string> seen_keys;
+    for (auto& alternative : alternatives) {
+      auto normalized = Canonicalize(std::move(alternative));
+      std::string key;
+      for (const auto& fragment : normalized) {
+        if (!key.empty()) {
+          key += '\x1f';
+        }
+        key += compute_cache_key_(fragment);
+      }
+      if (!seen_keys.insert(key).second) {
+        continue;
+      }
+      deduped.push_back(std::move(normalized));
+    }
+    return deduped;
+  }
+
+  FragmentAlternatives MakeSingle(const picojson::value& fragment) const {
+    return Dedup({FragmentList{fragment}});
+  }
+
+  FragmentAlternatives CrossProduct(
+      const FragmentAlternatives& lhs, const FragmentAlternatives& rhs
+  ) const {
+    if (lhs.empty() || rhs.empty()) {
+      return {};
+    }
+    FragmentAlternatives result;
+    result.reserve(lhs.size() * rhs.size());
+    for (const auto& left_parts : lhs) {
+      for (const auto& right_parts : rhs) {
+        FragmentList parts = left_parts;
+        parts.insert(parts.end(), right_parts.begin(), right_parts.end());
+        result.push_back(std::move(parts));
+      }
+    }
+    return Dedup(std::move(result));
+  }
+
+  void ApplyConjunctiveComponent(
+      FragmentAlternatives* positive_alternatives,
+      FragmentAlternatives* negative_alternatives,
+      ConditionAlternatives component
+  ) const {
+    *positive_alternatives =
+        CrossProduct(*positive_alternatives, component.positive_alternatives);
+    negative_alternatives->insert(
+        negative_alternatives->end(),
+        component.negative_alternatives.begin(),
+        component.negative_alternatives.end()
+    );
+    *negative_alternatives = Dedup(std::move(*negative_alternatives));
+  }
+
+ private:
+  std::function<std::string(const picojson::value&)> compute_cache_key_;
+};
+
 /*!
  * \brief Parser for JSON Schema, converts JSON Schema to SchemaSpec intermediate representation.
  */
@@ -174,9 +543,29 @@ class SchemaParser {
   Result<SchemaSpecPtr, SchemaError> ResolveRef(
       const std::string& uri, const std::string& rule_name_hint
   );
-  Result<SchemaSpecPtr, SchemaError> NormalizeExclusiveDisjunctions(const SchemaSpecPtr& spec);
+ Result<SchemaSpecPtr, SchemaError> NormalizeExclusiveDisjunctions(const SchemaSpecPtr& spec);
 
  private:
+  class SchemaPathGuard {
+   public:
+    SchemaPathGuard(SchemaParser* parser, std::initializer_list<std::string> segments)
+        : parser_(parser), old_size_(parser->schema_path_.size()) {
+      parser_->schema_path_.insert(parser_->schema_path_.end(), segments.begin(), segments.end());
+    }
+
+    ~SchemaPathGuard() { parser_->schema_path_.resize(old_size_); }
+
+   private:
+    SchemaParser* parser_;
+    size_t old_size_;
+  };
+
+  template <typename Fn>
+  auto WithSchemaPath(std::initializer_list<std::string> segments, Fn&& fn) -> decltype(fn()) {
+    SchemaPathGuard guard(this, segments);
+    return fn();
+  }
+
   Result<IntegerSpec, SchemaError> ParseInteger(const picojson::object& schema);
   Result<NumberSpec, SchemaError> ParseNumber(const picojson::object& schema);
   Result<StringSpec, SchemaError> ParseString(const picojson::object& schema);
@@ -238,6 +627,74 @@ class SchemaParser {
       std::unordered_set<const SchemaSpec*>* active_specs,
       std::unordered_set<const SchemaSpec*>* normalized_specs
   );
+  std::string SchemaPointerWith(std::initializer_list<std::string> extra_segments) const;
+  std::string CurrentSchemaPointer() const;
+  SchemaError AnnotateSchemaError(SchemaError err) const;
+  static std::string EscapeJsonPointerSegment(const std::string& segment);
+  SchemaError MakeConditionError(
+      std::initializer_list<std::string> segments,
+      const std::string& message,
+      const std::string& hint = ""
+  ) const;
+  Result<std::vector<std::string>, SchemaError> ExtractFiniteDomainFromJson(
+      const picojson::value& value,
+      const std::string& non_object_message,
+      const std::string& enum_array_message,
+      const std::string& missing_domain_message,
+      const std::function<std::string(const std::string&)>& make_unsupported_key_error,
+      bool allow_type_keyword = false,
+      bool require_non_empty_enum = false
+  ) const;
+  std::optional<std::vector<std::string>> ExtractFiniteDomainFromSpec(
+      const SchemaSpecPtr& spec
+  ) const;
+  SchemaSpecPtr MakeFiniteDomainSpec(
+      const std::vector<std::string>& values, const std::string& hint
+  ) const;
+  struct ForbiddenValueApplicationResult {
+    enum class Status {
+      kSupported,
+      kUnsatisfiable,
+      kUnsupportedNonFinite,
+    };
+    Status status;
+    SchemaSpecPtr schema;
+  };
+  Result<ForbiddenValueApplicationResult, SchemaError> ApplyForbiddenValuesToPropertySchema(
+      const SchemaSpecPtr& property_schema,
+      const std::vector<std::string>& forbidden_values,
+      const std::string& property_name,
+      const std::string& rule_name_hint
+  ) const;
+  struct ParsedFiniteNotEntry {
+    bool has_required = false;
+    std::vector<std::string> required_group;
+    std::optional<std::pair<std::string, std::vector<std::string>>> property_predicate;
+  };
+  struct ParsedObjectNotEntry {
+    ParsedFiniteNotEntry entry;
+    bool from_any_of = false;
+  };
+  Result<ParsedFiniteNotEntry, SchemaError> ParseSupportedFiniteNotEntry(
+      const picojson::object& entry_obj,
+      const std::string& context,
+      const std::string& unsupported_message,
+      const std::function<std::string(const std::string&)>& make_property_unsupported_key_error,
+      const std::string& property_non_object_message,
+      const std::string& property_enum_array_message,
+      const std::string& property_missing_domain_message,
+      bool allow_type_keyword_in_property = false,
+      bool require_non_empty_enum = true
+  ) const;
+  std::optional<std::vector<ParsedObjectNotEntry>> TryParseSupportedObjectNotEntries(
+      const picojson::value& not_value
+  ) const;
+  Result<bool, SchemaError> ApplyParsedObjectNotEntryToObjectSpec(
+      ObjectSpec* spec, ParsedObjectNotEntry parsed_not_entry
+  ) const;
+  Result<std::optional<picojson::object>, SchemaError> TryRewriteObjectNotAsConditional(
+      const picojson::object& schema
+  ) const;
 
   std::string ComputeCacheKey(const picojson::value& schema);
 
@@ -249,7 +706,432 @@ class SchemaParser {
   picojson::value root_schema_;
   std::unordered_map<std::string, SchemaSpecPtr> ref_cache_;
   std::unordered_map<std::string, SchemaSpecPtr> schema_cache_;
+  std::vector<std::string> schema_path_;
 };
+
+std::string SchemaParser::SchemaPointerWith(std::initializer_list<std::string> extra_segments) const {
+  if (schema_path_.empty() && extra_segments.size() == 0) {
+    return "#";
+  }
+  std::string pointer = "#";
+  for (const auto& segment : schema_path_) {
+    pointer += "/" + EscapeJsonPointerSegment(segment);
+  }
+  for (const auto& segment : extra_segments) {
+    pointer += "/" + EscapeJsonPointerSegment(segment);
+  }
+  return pointer;
+}
+
+std::string SchemaParser::CurrentSchemaPointer() const { return SchemaPointerWith({}); }
+
+SchemaError SchemaParser::AnnotateSchemaError(SchemaError err) const {
+  std::string message = err.what();
+  if (message.rfind("At schema path ", 0) == 0) {
+    return err;
+  }
+  return SchemaError(err.Type(), "At schema path " + CurrentSchemaPointer() + ": " + message);
+}
+
+std::string SchemaParser::EscapeJsonPointerSegment(const std::string& segment) {
+  std::string escaped;
+  escaped.reserve(segment.size());
+  for (char ch : segment) {
+    if (ch == '~') {
+      escaped += "~0";
+    } else if (ch == '/') {
+      escaped += "~1";
+    } else {
+      escaped += ch;
+    }
+  }
+  return escaped;
+}
+
+SchemaError SchemaParser::MakeConditionError(
+    std::initializer_list<std::string> segments,
+    const std::string& message,
+    const std::string& hint
+) const {
+  std::string full_message = "At schema path " + SchemaPointerWith(segments) + ": " + message;
+  if (!hint.empty()) {
+    full_message += " Hint: " + hint;
+  }
+  return SchemaError(SchemaErrorType::kInvalidSchema, std::move(full_message));
+}
+
+Result<std::vector<std::string>, SchemaError> SchemaParser::ExtractFiniteDomainFromJson(
+    const picojson::value& value,
+    const std::string& non_object_message,
+    const std::string& enum_array_message,
+    const std::string& missing_domain_message,
+    const std::function<std::string(const std::string&)>& make_unsupported_key_error,
+    bool allow_type_keyword,
+    bool require_non_empty_enum
+) const {
+  if (!value.is<picojson::object>()) {
+    return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, non_object_message);
+  }
+  const auto& obj = value.get<picojson::object>();
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
+  for (const auto& key : obj.ordered_keys()) {
+    if (key == "const" || key == "enum" || (allow_type_keyword && key == "type") ||
+        kIgnoredKeys.count(key) != 0) {
+      continue;
+    }
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema, make_unsupported_key_error(key)
+    );
+  }
+
+  std::vector<std::string> values;
+  if (obj.count("const")) {
+    values.push_back(obj.at("const").serialize());
+    return ResultOk(std::move(values));
+  }
+  if (obj.count("enum")) {
+    if (!obj.at("enum").is<picojson::array>()) {
+      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, enum_array_message);
+    }
+    for (const auto& item : obj.at("enum").get<picojson::array>()) {
+      PushBackUnique(&values, item.serialize());
+    }
+    if (require_non_empty_enum && values.empty()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, missing_domain_message + " enum must not be empty"
+      );
+    }
+    return ResultOk(std::move(values));
+  }
+  return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, missing_domain_message);
+}
+
+std::optional<std::vector<std::string>> SchemaParser::ExtractFiniteDomainFromSpec(
+    const SchemaSpecPtr& spec
+) const {
+  if (std::holds_alternative<ConstSpec>(spec->spec)) {
+    return std::vector<std::string>{std::get<ConstSpec>(spec->spec).json_value};
+  }
+  if (std::holds_alternative<EnumSpec>(spec->spec)) {
+    return std::get<EnumSpec>(spec->spec).json_values;
+  }
+  return std::nullopt;
+}
+
+SchemaSpecPtr SchemaParser::MakeFiniteDomainSpec(
+    const std::vector<std::string>& values, const std::string& hint
+) const {
+  if (values.size() == 1) {
+    return SchemaSpec::Make(ConstSpec{values[0]}, "", hint);
+  }
+  return SchemaSpec::Make(EnumSpec{values}, "", hint);
+}
+
+Result<SchemaParser::ForbiddenValueApplicationResult, SchemaError>
+SchemaParser::ApplyForbiddenValuesToPropertySchema(
+    const SchemaSpecPtr& property_schema,
+    const std::vector<std::string>& forbidden_values,
+    const std::string& property_name,
+    const std::string& rule_name_hint
+) const {
+  auto domain_values = ExtractFiniteDomainFromSpec(property_schema);
+  if (!domain_values.has_value()) {
+    return ResultOk(ForbiddenValueApplicationResult{
+        ForbiddenValueApplicationResult::Status::kUnsupportedNonFinite, nullptr});
+  }
+
+  auto allowed_values = *domain_values;
+  allowed_values.erase(
+      std::remove_if(
+          allowed_values.begin(),
+          allowed_values.end(),
+          [&](const std::string& value) {
+            return std::find(forbidden_values.begin(), forbidden_values.end(), value) !=
+                   forbidden_values.end();
+          }
+      ),
+      allowed_values.end()
+  );
+  if (allowed_values.empty()) {
+    return ResultOk(ForbiddenValueApplicationResult{
+        ForbiddenValueApplicationResult::Status::kUnsatisfiable, nullptr});
+  }
+
+  return ResultOk(ForbiddenValueApplicationResult{
+      ForbiddenValueApplicationResult::Status::kSupported,
+      MakeFiniteDomainSpec(allowed_values, rule_name_hint + "_" + property_name + "_allowed")});
+}
+
+Result<SchemaParser::ParsedFiniteNotEntry, SchemaError> SchemaParser::ParseSupportedFiniteNotEntry(
+    const picojson::object& entry_obj,
+    const std::string& context,
+    const std::string& unsupported_message,
+    const std::function<std::string(const std::string&)>& make_property_unsupported_key_error,
+    const std::string& property_non_object_message,
+    const std::string& property_enum_array_message,
+    const std::string& property_missing_domain_message,
+    bool allow_type_keyword_in_property,
+    bool require_non_empty_enum
+) const {
+  bool has_required = entry_obj.count("required");
+  bool has_properties = entry_obj.count("properties");
+  if (!has_required && !has_properties) {
+    return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, unsupported_message);
+  }
+
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
+  for (const auto& key : entry_obj.ordered_keys()) {
+    if (key == "required" || key == "properties" || key == "type" ||
+        kIgnoredKeys.count(key) != 0) {
+      continue;
+    }
+    return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, unsupported_message);
+  }
+  if (entry_obj.count("type")) {
+    if (!entry_obj.at("type").is<std::string>() ||
+        entry_obj.at("type").get<std::string>() != "object") {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, context + " type must be object"
+      );
+    }
+  }
+
+  ParsedFiniteNotEntry parsed_entry;
+  if (has_required) {
+    parsed_entry.has_required = true;
+    if (!entry_obj.at("required").is<picojson::array>()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema, context + " required must be an array"
+      );
+    }
+    for (const auto& item : entry_obj.at("required").get<picojson::array>()) {
+      if (!item.is<std::string>()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, context + " required must contain only strings"
+        );
+      }
+      PushBackUnique(&parsed_entry.required_group, item.get<std::string>());
+    }
+  }
+
+  if (!has_properties) {
+    return ResultOk(std::move(parsed_entry));
+  }
+  if (!entry_obj.at("properties").is<picojson::object>()) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema, context + " properties must be an object"
+    );
+  }
+  const auto& properties_obj = entry_obj.at("properties").get<picojson::object>();
+  if (properties_obj.size() != 1) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema,
+        context + " properties must contain exactly one finite-domain predicate"
+    );
+  }
+
+  const auto& property_name = properties_obj.ordered_keys()[0];
+  auto values_result = ExtractFiniteDomainFromJson(
+      properties_obj.at(property_name),
+      property_non_object_message,
+      property_enum_array_message,
+      property_missing_domain_message,
+      make_property_unsupported_key_error,
+      allow_type_keyword_in_property,
+      require_non_empty_enum
+  );
+  if (values_result.IsErr()) {
+    return ResultErr(std::move(values_result).UnwrapErr());
+  }
+  parsed_entry.property_predicate =
+      std::make_pair(property_name, std::move(values_result).Unwrap());
+  return ResultOk(std::move(parsed_entry));
+}
+
+std::optional<std::vector<SchemaParser::ParsedObjectNotEntry>>
+SchemaParser::TryParseSupportedObjectNotEntries(const picojson::value& not_value) const {
+  if (!not_value.is<picojson::object>()) {
+    return std::nullopt;
+  }
+
+  const auto& not_obj = not_value.get<picojson::object>();
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
+  auto container_keys_supported = [&](bool allow_required, bool allow_anyof) {
+    for (const auto& key : not_obj.ordered_keys()) {
+      if ((allow_required && key == "required") || (allow_anyof && key == "anyOf") ||
+          key == "properties" || key == "type" || kIgnoredKeys.count(key) != 0) {
+        continue;
+      }
+      return false;
+    }
+    if (not_obj.count("type")) {
+      if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::vector<ParsedObjectNotEntry> entries;
+  if (not_obj.count("required") || not_obj.count("properties")) {
+    if (!container_keys_supported(/*allow_required=*/true, /*allow_anyof=*/false)) {
+      return std::nullopt;
+    }
+    auto parsed_entry_result = ParseSupportedFiniteNotEntry(
+        not_obj,
+        "object not",
+        "object not only supports required groups or required property const/enum predicates",
+        [&](const std::string&) { return "object not property predicates only support const or enum"; },
+        "object not property predicate must be an object containing const or enum",
+        "object not property enum must be an array",
+        "object not property predicates must contain const or enum",
+        /*allow_type_keyword_in_property=*/true
+    );
+    if (parsed_entry_result.IsErr()) {
+      return std::nullopt;
+    }
+    auto parsed_entry = std::move(parsed_entry_result).Unwrap();
+    if (!parsed_entry.has_required && !parsed_entry.property_predicate.has_value()) {
+      return std::nullopt;
+    }
+    entries.push_back({std::move(parsed_entry), false});
+    return entries;
+  }
+
+  if (!not_obj.count("anyOf")) {
+    return std::nullopt;
+  }
+  if (!container_keys_supported(/*allow_required=*/false, /*allow_anyof=*/true) ||
+      !not_obj.at("anyOf").is<picojson::array>()) {
+    return std::nullopt;
+  }
+
+  for (const auto& option : not_obj.at("anyOf").get<picojson::array>()) {
+    if (!option.is<picojson::object>()) {
+      return std::nullopt;
+    }
+    auto parsed_entry_result = ParseSupportedFiniteNotEntry(
+        option.get<picojson::object>(),
+        "not anyOf entry",
+        "not anyOf entry only supports required groups or required property const/enum predicates",
+        [&](const std::string&) {
+          return "not anyOf entry property predicates only support const or enum";
+        },
+        "not anyOf entry property predicate must be an object containing const or enum",
+        "not anyOf entry property enum must be an array",
+        "not anyOf entry property predicates must contain const or enum",
+        /*allow_type_keyword_in_property=*/true
+    );
+    if (parsed_entry_result.IsErr()) {
+      return std::nullopt;
+    }
+    auto parsed_entry = std::move(parsed_entry_result).Unwrap();
+    if (!parsed_entry.has_required && !parsed_entry.property_predicate.has_value()) {
+      return std::nullopt;
+    }
+    entries.push_back({std::move(parsed_entry), true});
+  }
+  return entries;
+}
+
+Result<bool, SchemaError> SchemaParser::ApplyParsedObjectNotEntryToObjectSpec(
+    ObjectSpec* spec, ParsedObjectNotEntry parsed_not_entry
+) const {
+  auto& parsed_entry = parsed_not_entry.entry;
+  if (parsed_entry.property_predicate.has_value()) {
+    const auto& property_name = parsed_entry.property_predicate->first;
+    bool property_required =
+        spec->required.count(property_name) ||
+        std::find(
+            parsed_entry.required_group.begin(), parsed_entry.required_group.end(), property_name
+        ) != parsed_entry.required_group.end();
+    if (!property_required) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          parsed_not_entry.from_any_of
+              ? "not anyOf entry property predicate must also be listed in required or be base-required"
+              : "object not property predicate must also be listed in required or be base-required"
+      );
+    }
+    auto property_it = std::find_if(
+        spec->properties.begin(),
+        spec->properties.end(),
+        [&](const ObjectSpec::Property& property) { return property.name == property_name; }
+    );
+    if (property_it == spec->properties.end()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "object not property predicates require a direct sibling property definition with const or enum: " +
+              property_name
+      );
+    }
+    auto domain_values = ExtractFiniteDomainFromSpec(property_it->schema);
+    if (!domain_values.has_value()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "object not property predicates require a direct sibling property definition with const or enum: " +
+              property_name
+      );
+    }
+    std::vector<std::string> effective_forbidden_values;
+    for (const auto& value : parsed_entry.property_predicate->second) {
+      if (std::find(domain_values->begin(), domain_values->end(), value) != domain_values->end()) {
+        PushBackUnique(&effective_forbidden_values, value);
+      }
+    }
+    if (!effective_forbidden_values.empty()) {
+      PushBackUnique(
+          &spec->forbidden_property_values,
+          std::make_pair(property_name, std::move(effective_forbidden_values))
+      );
+    }
+    return ResultOk(true);
+  }
+  if (!parsed_entry.has_required) {
+    return ResultErr<SchemaError>(
+        SchemaErrorType::kInvalidSchema,
+        parsed_not_entry.from_any_of
+            ? "not anyOf entry only supports required groups or required property const/enum predicates"
+            : "object not only supports required groups, or required property const/enum predicates, or anyOf of those"
+    );
+  }
+  PushBackUnique(&spec->forbidden_groups, std::move(parsed_entry.required_group));
+  return ResultOk(true);
+}
+
+Result<std::optional<picojson::object>, SchemaError>
+SchemaParser::TryRewriteObjectNotAsConditional(const picojson::object& schema) const {
+  if (!schema.count("not") || schema.count("if") || schema.count("then") || schema.count("else")) {
+    return ResultOk(std::nullopt);
+  }
+
+  auto is_object_like_for_not_rewrite = [&](const picojson::object& obj) {
+    if (obj.count("type")) {
+      if (!obj.at("type").is<std::string>() || obj.at("type").get<std::string>() != "object") {
+        return false;
+      }
+    }
+    return obj.count("type") || obj.count("properties") || obj.count("required") ||
+           obj.count("dependentRequired") || obj.count("patternProperties") ||
+           obj.count("propertyNames") || obj.count("additionalProperties") ||
+           obj.count("unevaluatedProperties") || obj.count("minProperties") ||
+           obj.count("maxProperties") || obj.count("allOf") || obj.count("anyOf") ||
+           obj.count("oneOf");
+  };
+  if (!is_object_like_for_not_rewrite(schema)) {
+    return ResultOk(std::nullopt);
+  }
+
+  if (TryParseSupportedObjectNotEntries(schema.at("not")).has_value()) {
+    return ResultOk(std::nullopt);
+  }
+
+  picojson::object rewritten_schema = schema;
+  rewritten_schema["if"] = rewritten_schema.at("not");
+  rewritten_schema.erase("not");
+  rewritten_schema["then"] = picojson::value(false);
+  return ResultOk(std::move(rewritten_schema));
+}
 
 bool SchemaParser::IsPartialObjectFragment(const picojson::object& schema) const {
   if (schema.count("type")) {
@@ -306,16 +1188,7 @@ Result<picojson::value, SchemaError> SchemaParser::RewriteDependentSchemasAsAllO
     );
   }
 
-  static const std::unordered_set<std::string> kIgnoredKeys = {
-      "title",
-      "default",
-      "description",
-      "examples",
-      "deprecated",
-      "readOnly",
-      "writeOnly",
-      "$comment",
-  };
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
 
   std::function<Result<bool, SchemaError>(const picojson::value&, const std::string&)>
       validate_dependent_schema = [&](const picojson::value& dependent_schema,
@@ -525,16 +1398,7 @@ SchemaParser::TryParseConditionalDiscriminatorFamilyAsAnyOf(
     return values;
   };
 
-  static const std::unordered_set<std::string> kIgnoredKeys = {
-      "title",
-      "default",
-      "description",
-      "examples",
-      "deprecated",
-      "readOnly",
-      "writeOnly",
-      "$comment",
-  };
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
 
   std::function<Result<bool, SchemaError>(
       const picojson::value&, std::vector<std::vector<std::string>>*)>
@@ -1046,23 +1910,25 @@ std::string SchemaParser::ComputeCacheKey(const picojson::value& schema) {
   };
 
   if (schema.is<picojson::object>()) {
+    const auto& obj = schema.get<picojson::object>();
     std::string result = "{";
-    std::vector<std::pair<std::string, picojson::value>> sorted_kv;
-    for (const auto& kv : schema.get<picojson::object>()) {
-      if (kSkippedKeys.count(kv.first) == 0) {
-        sorted_kv.push_back(kv);
+    std::vector<const std::string*> sorted_keys;
+    sorted_keys.reserve(obj.size());
+    for (const auto& key : obj.ordered_keys()) {
+      if (kSkippedKeys.count(key) == 0) {
+        sorted_keys.push_back(&key);
       }
     }
-    std::sort(sorted_kv.begin(), sorted_kv.end(), [](const auto& lhs, const auto& rhs) {
-      return lhs.first < rhs.first;
+    std::sort(sorted_keys.begin(), sorted_keys.end(), [](const std::string* lhs, const std::string* rhs) {
+      return *lhs < *rhs;
     });
     int64_t idx = 0;
-    for (const auto& [key, value] : sorted_kv) {
+    for (const auto* key : sorted_keys) {
       if (idx != 0) {
         result += ",";
       }
       ++idx;
-      result += "\"" + key + "\":" + ComputeCacheKey(value);
+      result += "\"" + *key + "\":" + ComputeCacheKey(obj.at(*key));
     }
     return result + "}";
   } else if (schema.is<picojson::array>()) {
@@ -1119,7 +1985,8 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
       };
 
   auto parse_branch_with_base =
-      [&](const picojson::value& branch_schema) -> Result<SchemaSpecPtr, SchemaError> {
+      [&](const picojson::value& branch_schema,
+          const std::string& branch_key) -> Result<SchemaSpecPtr, SchemaError> {
     std::vector<picojson::value> parts;
     if (!base_schema.empty()) {
       parts.push_back(picojson::value(base_schema));
@@ -1129,7 +1996,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     } else {
       parts.push_back(branch_schema);
     }
-    return Parse(combine_constraints(parts), rule_name_hint);
+    return WithSchemaPath({branch_key}, [&]() { return Parse(combine_constraints(parts), rule_name_hint); });
   };
 
   if (!schema.count("if")) {
@@ -1140,66 +2007,120 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
   if (if_value.is<bool>()) {
     if (if_value.get<bool>()) {
       if (schema.count("then")) {
-        return parse_branch_with_base(schema.at("then"));
+        return parse_branch_with_base(schema.at("then"), "then");
       }
       return Parse(picojson::value(base_schema), rule_name_hint);
     }
     if (schema.count("else")) {
-      return parse_branch_with_base(schema.at("else"));
+      return parse_branch_with_base(schema.at("else"), "else");
     }
     return Parse(picojson::value(base_schema), rule_name_hint);
   }
 
   if (!if_value.is<picojson::object>()) {
-    return ResultErr<SchemaError>(
-        SchemaErrorType::kInvalidSchema, "if must be an object or boolean"
-    );
+    return ResultErr<SchemaError>(MakeConditionError({"if"}, "if must be an object or boolean"));
   }
   if (schema.count("$ref")) {
     return ResultErr<SchemaError>(
-        SchemaErrorType::kInvalidSchema, "if/then/else with $ref siblings is not supported"
+        MakeConditionError({"$ref"}, "if/then/else with $ref siblings is not supported")
     );
   }
 
   const auto& if_obj = if_value.get<picojson::object>();
-  static const std::unordered_set<std::string> kIgnoredKeys = {
-      "title",
-      "default",
-      "description",
-      "examples",
-      "deprecated",
-      "readOnly",
-      "writeOnly",
-      "$comment",
+  const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
+
+  auto quote_keyword = [](const std::string& key) { return "\"" + key + "\""; };
+  auto make_unsupported_condition_keyword_error =
+      [&](const std::string& context, const std::string& key) -> SchemaError {
+        return MakeConditionError(
+            {"if"},
+            context + " has unsupported keyword " + quote_keyword(key) +
+                ". Supported keys: type, required, properties, not, anyOf, allOf.",
+            "rewrite the condition into local object predicates, or move this validation "
+            "outside if/then/else."
+        );
+      };
+  auto make_unsupported_property_predicate_error =
+      [&](const std::string& context,
+          const std::string& property_name,
+          const std::string& key) -> SchemaError {
+        return MakeConditionError(
+            {"if", "properties", property_name},
+            context + ": if property predicates only support const or enum; found unsupported "
+                "keyword " +
+                quote_keyword(key) + ".",
+            "rewrite this predicate as a finite const/enum check, or move range/pattern "
+            "validation outside the conditional."
+        );
+      };
+  auto make_missing_finite_predicate_error =
+      [&](const std::string& context, const std::string& property_name) -> SchemaError {
+    return MakeConditionError(
+        {"if", "properties", property_name},
+        context + ": if property predicates must contain const or enum to keep the predicate "
+                  "finite.",
+        "rewrite this predicate as a finite const/enum check, or move this validation outside "
+        "the conditional."
+    );
   };
+  auto make_required_membership_error =
+      [&](const std::string& context,
+          const std::string& predicate_property_name,
+          const std::string& required_property_name) -> SchemaError {
+        return MakeConditionError(
+            {"if", "properties", predicate_property_name},
+            context + " property " + quote_keyword(required_property_name) +
+                " must also be listed in required unless the base schema already requires it."
+        );
+      };
+  auto make_array_predicate_keyword_error =
+      [&](const std::string& property_name, const std::string& key) -> SchemaError {
+        return MakeConditionError(
+            {"if", "properties", property_name},
+            "if array predicate for property " + quote_keyword(property_name) +
+                " has unsupported keyword " + quote_keyword(key) +
+                ". Supported form is an array object with contains and optional minContains == 1.",
+            "rewrite the condition as contains with minContains == 1, or move richer array "
+            "logic outside if/then/else."
+        );
+      };
+  auto make_array_contains_keyword_error =
+      [&](const std::string& property_name, const std::string& key) -> SchemaError {
+        return MakeConditionError(
+            {"if", "properties", property_name, "contains"},
+            "if array contains predicate for property " + quote_keyword(property_name) +
+                " has unsupported keyword " + quote_keyword(key) +
+                ". Supported keys: type, required, properties, not, anyOf, allOf.",
+            "rewrite item predicates into local required/properties/not checks with finite "
+            "const/enum values."
+        );
+      };
 
   if (if_obj.count("type")) {
     if (!if_obj.at("type").is<std::string>() || if_obj.at("type").get<std::string>() != "object") {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "if type must be object"
-      );
+      return ResultErr<SchemaError>(MakeConditionError({"if", "type"}, "if type must be object"));
     }
   }
 
   for (const auto& key : if_obj.ordered_keys()) {
-    if (key == "type" || key == "required" || key == "properties" || kIgnoredKeys.count(key) != 0) {
+    if (key == "type" || key == "required" || key == "properties" || key == "anyOf" ||
+        key == "allOf" || key == "not" || kIgnoredKeys.count(key) != 0) {
       continue;
     }
-    return ResultErr<SchemaError>(
-        SchemaErrorType::kInvalidSchema,
-        "if only supports object required and properties with const/enum predicates"
-    );
+    return ResultErr<SchemaError>(make_unsupported_condition_keyword_error("if", key));
   }
 
   std::unordered_set<std::string> required_names;
   if (if_obj.count("required")) {
     if (!if_obj.at("required").is<picojson::array>()) {
-      return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "if required must be an array");
+      return ResultErr<SchemaError>(
+          MakeConditionError({"if", "required"}, "if required must be an array")
+      );
     }
     for (const auto& item : if_obj.at("required").get<picojson::array>()) {
       if (!item.is<std::string>()) {
         return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "if required must contain only strings"
+            MakeConditionError({"if", "required"}, "if required must contain only strings")
         );
       }
       required_names.insert(item.get<std::string>());
@@ -1214,7 +2135,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
 
   struct ArrayContainsPredicate {
     std::string name;
-    picojson::value positive_fragment;
+    std::vector<picojson::value> positive_fragments;
     picojson::value negative_present_fragment;
   };
 
@@ -1224,44 +2145,30 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
   std::unordered_set<std::string> property_predicate_names;
 
   auto extract_finite_domain =
-      [&](const picojson::value& value) -> Result<std::vector<std::string>, SchemaError> {
-    if (!value.is<picojson::object>()) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "if property predicate must be an object"
-      );
-    }
-    const auto& obj = value.get<picojson::object>();
-    for (const auto& key : obj.ordered_keys()) {
-      if (key == "const" || key == "enum" || key == "type" || kIgnoredKeys.count(key) != 0) {
-        continue;
-      }
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema,
-          "if property predicates only support const or enum"
-      );
-    }
-    std::vector<std::string> values;
-    if (obj.count("const")) {
-      values.push_back(obj.at("const").serialize());
-    } else if (obj.count("enum")) {
-      if (!obj.at("enum").is<picojson::array>()) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "if property enum must be an array"
-        );
-      }
-      for (const auto& item : obj.at("enum").get<picojson::array>()) {
-        auto serialized = item.serialize();
-        if (std::find(values.begin(), values.end(), serialized) == values.end()) {
-          values.push_back(serialized);
-        }
-      }
-    } else {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema,
-          "if property predicates must contain const or enum"
-      );
-    }
-    return ResultOk(std::move(values));
+      [&](const picojson::value& value,
+          const std::string& context,
+          const std::string& property_name_for_path) -> Result<std::vector<std::string>, SchemaError> {
+    const std::string enum_array_message = std::string(
+        MakeConditionError(
+            {"if", "properties", property_name_for_path}, "if property enum must be an array"
+        )
+            .what()
+    );
+    const std::string missing_domain_message = std::string(
+        make_missing_finite_predicate_error(context, property_name_for_path).what()
+    );
+    return ExtractFiniteDomainFromJson(
+        value,
+        context + ": if property predicate must be an object containing const or enum",
+        enum_array_message,
+        missing_domain_message,
+        [&](const std::string& key) {
+          return std::string(
+              make_unsupported_property_predicate_error(context, property_name_for_path, key).what()
+          );
+        },
+        /*allow_type_keyword=*/true
+    );
   };
 
   auto make_required_array = [](const std::vector<std::string>& names) {
@@ -1271,6 +2178,10 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     }
     return required;
   };
+
+  FragmentAlternativeOps fragment_ops(
+      [&](const picojson::value& value) { return ComputeCacheKey(value); }
+  );
 
   auto try_rewrite_required_only_conditional =
       [&]() -> Result<std::optional<SchemaSpecPtr>, SchemaError> {
@@ -1285,7 +2196,8 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
 
     if (then_value.is<bool>()) {
       if (then_value.get<bool>()) {
-        auto parse_result = parse_branch_with_base(picojson::value(picojson::object{}));
+        auto parse_result =
+            parse_branch_with_base(picojson::value(picojson::object{}), "then");
         if (parse_result.IsErr()) return ResultErr(std::move(parse_result).UnwrapErr());
         return ResultOk(std::optional<SchemaSpecPtr>(std::move(parse_result).Unwrap()));
       }
@@ -1293,7 +2205,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
       not_obj["required"] = picojson::value(make_required_array(condition_required));
       picojson::object fragment;
       fragment["not"] = picojson::value(not_obj);
-      auto parse_result = parse_branch_with_base(picojson::value(fragment));
+      auto parse_result = parse_branch_with_base(picojson::value(fragment), "then");
       if (parse_result.IsErr()) return ResultErr(std::move(parse_result).UnwrapErr());
       return ResultOk(std::optional<SchemaSpecPtr>(std::move(parse_result).Unwrap()));
     }
@@ -1342,7 +2254,8 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     }
 
     if (dependent_required.empty()) {
-      auto parse_result = parse_branch_with_base(picojson::value(picojson::object{}));
+      auto parse_result =
+          parse_branch_with_base(picojson::value(picojson::object{}), "then");
       if (parse_result.IsErr()) return ResultErr(std::move(parse_result).UnwrapErr());
       return ResultOk(std::optional<SchemaSpecPtr>(std::move(parse_result).Unwrap()));
     }
@@ -1351,7 +2264,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     dependencies[condition_required[0]] = picojson::value(make_required_array(dependent_required));
     picojson::object fragment;
     fragment["dependentRequired"] = picojson::value(dependencies);
-    auto parse_result = parse_branch_with_base(picojson::value(fragment));
+    auto parse_result = parse_branch_with_base(picojson::value(fragment), "then");
     if (parse_result.IsErr()) return ResultErr(std::move(parse_result).UnwrapErr());
     return ResultOk(std::optional<SchemaSpecPtr>(std::move(parse_result).Unwrap()));
   };
@@ -1399,6 +2312,26 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         return picojson::value(reason);
       };
 
+  auto make_finite_domain_schema = [&](const std::vector<std::string>& values) {
+    picojson::object property_schema;
+    if (values.size() == 1) {
+      picojson::value parsed_value;
+      std::string err = picojson::parse(parsed_value, values[0]);
+      XGRAMMAR_CHECK(err.empty()) << "Failed to parse serialized enum value";
+      property_schema["const"] = parsed_value;
+    } else {
+      picojson::array enum_values;
+      for (const auto& value : values) {
+        picojson::value parsed_value;
+        std::string err = picojson::parse(parsed_value, value);
+        XGRAMMAR_CHECK(err.empty()) << "Failed to parse serialized enum value";
+        enum_values.push_back(parsed_value);
+      }
+      property_schema["enum"] = picojson::value(enum_values);
+    }
+    return picojson::value(property_schema);
+  };
+
   auto make_required_property_fragment =
       [&](const std::string& property_name, const picojson::value& property_schema) {
         picojson::object properties;
@@ -1408,6 +2341,10 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         fragment["required"] = picojson::value(make_required_array({property_name}));
         return picojson::value(fragment);
       };
+
+  std::function<Result<ConditionAlternatives, SchemaError>(
+      const picojson::value&, const picojson::object*, const std::string&)>
+      parse_condition;
 
   auto parse_array_contains_predicate =
       [&](const std::string& property_name,
@@ -1425,8 +2362,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
             continue;
           }
           return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema,
-              "if array predicates only support contains with minContains == 1"
+              make_array_predicate_keyword_error(property_name, key)
           );
         }
         if (array_obj.count("type")) {
@@ -1480,13 +2416,13 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         }
         const auto& contains_obj = contains_value.get<picojson::object>();
         for (const auto& key : contains_obj.ordered_keys()) {
-          if (key == "type" || key == "required" || key == "properties" ||
+          if (key == "type" || key == "required" || key == "properties" || key == "anyOf" ||
+              key == "allOf" || key == "not" ||
               kIgnoredKeys.count(key) != 0) {
             continue;
           }
           return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema,
-              "if array contains predicates only support object required and properties with const/enum predicates"
+              make_array_contains_keyword_error(property_name, key)
           );
         }
         if (contains_obj.count("type")) {
@@ -1497,130 +2433,50 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
             );
           }
         }
-
-        std::unordered_set<std::string> item_required_names;
-        if (contains_obj.count("required")) {
-          if (!contains_obj.at("required").is<picojson::array>()) {
-            return ResultErr<SchemaError>(
-                SchemaErrorType::kInvalidSchema,
-                "if array contains required must be an array"
-            );
-          }
-          for (const auto& item : contains_obj.at("required").get<picojson::array>()) {
-            if (!item.is<std::string>()) {
-              return ResultErr<SchemaError>(
-                  SchemaErrorType::kInvalidSchema,
-                  "if array contains required must contain only strings"
-              );
-            }
-            item_required_names.insert(item.get<std::string>());
-          }
+        auto item_condition_result =
+            parse_condition(contains_value, &base_item_obj, "if array contains");
+        if (item_condition_result.IsErr()) {
+          return ResultErr(std::move(item_condition_result).UnwrapErr());
         }
+        auto item_condition = std::move(item_condition_result).Unwrap();
 
-        std::unordered_set<std::string> base_item_required_names;
-        if (base_item_obj.count("required") && base_item_obj.at("required").is<picojson::array>()) {
-          for (const auto& item : base_item_obj.at("required").get<picojson::array>()) {
-            if (item.is<std::string>()) {
-              base_item_required_names.insert(item.get<std::string>());
-            }
+        auto build_item_alternative_schema =
+            [&](const FragmentList& parts, bool include_base_item_schema) -> picojson::value {
+          std::vector<picojson::value> schema_parts;
+          if (include_base_item_schema) {
+            schema_parts.push_back(picojson::value(base_item_obj));
           }
-        }
+          for (const auto& part : parts) {
+            schema_parts.push_back(NormalizePartialObjectFragment(part));
+          }
+          return combine_constraints(schema_parts);
+        };
 
-        std::vector<std::string> item_required_only_names;
-        std::vector<PropertyPredicate> item_property_predicates;
-        std::unordered_set<std::string> item_predicate_names;
-        const picojson::object* base_item_properties = nullptr;
-        if (base_item_obj.count("properties") && base_item_obj.at("properties").is<picojson::object>()) {
-          base_item_properties = &base_item_obj.at("properties").get<picojson::object>();
-        }
-
-        if (contains_obj.count("properties")) {
-          if (!contains_obj.at("properties").is<picojson::object>()) {
-            return ResultErr<SchemaError>(
-                SchemaErrorType::kInvalidSchema,
-                "if array contains properties must be an object"
-            );
-          }
-          const auto& item_properties = contains_obj.at("properties").get<picojson::object>();
-          for (const auto& item_property_name : item_properties.ordered_keys()) {
-            if (!item_required_names.count(item_property_name) &&
-                !base_item_required_names.count(item_property_name)) {
-              return ResultErr<SchemaError>(
-                  SchemaErrorType::kInvalidSchema,
-                  "if array contains property predicates must also be listed in required"
-              );
-            }
-            auto positive_result = extract_finite_domain(item_properties.at(item_property_name));
-            if (positive_result.IsErr()) return ResultErr(std::move(positive_result).UnwrapErr());
-            auto positive_values = std::move(positive_result).Unwrap();
-
-            if (!base_item_properties || !base_item_properties->count(item_property_name)) {
-              return ResultErr<SchemaError>(
-                  SchemaErrorType::kInvalidSchema,
-                  "if array predicates require a direct sibling item property definition with const or enum: " +
-                      item_property_name
-              );
-            }
-            auto domain_result = extract_finite_domain(base_item_properties->at(item_property_name));
-            if (domain_result.IsErr()) {
-              return ResultErr<SchemaError>(
-                  SchemaErrorType::kInvalidSchema,
-                  "if array predicates require a direct sibling item property definition with const or enum: " +
-                      item_property_name
-              );
-            }
-            auto domain_values = std::move(domain_result).Unwrap();
-            std::vector<std::string> negative_values;
-            for (const auto& domain_value : domain_values) {
-              if (std::find(positive_values.begin(), positive_values.end(), domain_value) ==
-                  positive_values.end()) {
-                negative_values.push_back(domain_value);
-              }
-            }
-
-            item_property_predicates.push_back(
-                {item_property_name, std::move(positive_values), std::move(negative_values)}
-            );
-            item_predicate_names.insert(item_property_name);
-          }
-        }
-
-        for (const auto& required_name : item_required_names) {
-          if (!item_predicate_names.count(required_name)) {
-            item_required_only_names.push_back(required_name);
-          }
-        }
-
-        std::vector<picojson::value> negative_item_reasons;
-        for (const auto& required_name : item_required_only_names) {
-          if (!base_item_required_names.count(required_name)) {
-            negative_item_reasons.push_back(make_absence_reason(required_name));
-          }
-        }
-        for (const auto& predicate : item_property_predicates) {
-          if (!base_item_required_names.count(predicate.name)) {
-            negative_item_reasons.push_back(make_absence_reason(predicate.name));
-          }
-          if (!predicate.negative_values.empty()) {
-            negative_item_reasons.push_back(make_value_reason(predicate.name, predicate.negative_values));
-          }
+        std::vector<picojson::value> positive_array_fragments;
+        positive_array_fragments.reserve(item_condition.positive_alternatives.size());
+        for (const auto& positive_parts : item_condition.positive_alternatives) {
+          picojson::object positive_array_schema;
+          positive_array_schema["type"] = picojson::value("array");
+          positive_array_schema["contains"] =
+              build_item_alternative_schema(positive_parts, true);
+          positive_array_fragments.push_back(picojson::value(positive_array_schema));
         }
 
         picojson::value negative_item_schema;
-        if (negative_item_reasons.empty()) {
+        if (item_condition.negative_alternatives.empty()) {
           negative_item_schema = picojson::value(false);
-        } else if (negative_item_reasons.size() == 1) {
-          negative_item_schema = negative_item_reasons.front();
+        } else if (item_condition.negative_alternatives.size() == 1) {
+          negative_item_schema =
+              combine_constraints(item_condition.negative_alternatives.front());
         } else {
+          picojson::array negative_alternatives;
+          for (const auto& negative_parts : item_condition.negative_alternatives) {
+            negative_alternatives.push_back(combine_constraints(negative_parts));
+          }
           picojson::object any_of_obj;
-          any_of_obj["anyOf"] = picojson::value(picojson::array(
-              negative_item_reasons.begin(), negative_item_reasons.end()));
+          any_of_obj["anyOf"] = picojson::value(negative_alternatives);
           negative_item_schema = picojson::value(any_of_obj);
         }
-
-        picojson::object positive_array_schema;
-        positive_array_schema["type"] = picojson::value("array");
-        positive_array_schema["contains"] = contains_value;
 
         picojson::object negative_array_schema;
         negative_array_schema["type"] = picojson::value("array");
@@ -1628,17 +2484,41 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
 
         return ResultOk(ArrayContainsPredicate{
             property_name,
-            make_required_property_fragment(property_name, picojson::value(positive_array_schema)),
+            std::move(positive_array_fragments),
             make_required_property_fragment(property_name, picojson::value(negative_array_schema)),
         });
       };
 
-  std::function<Result<std::vector<picojson::value>, SchemaError>(
-      const picojson::object&, const picojson::object*, const std::string&)>
-      parse_object_condition =
-          [&](const picojson::object& condition_obj,
+  parse_condition =
+      [&](const picojson::value& condition_value,
               const picojson::object* available_base_schema,
-              const std::string& context) -> Result<std::vector<picojson::value>, SchemaError> {
+              const std::string& context) -> Result<ConditionAlternatives, SchemaError> {
+        auto make_direct_sibling_domain_error = [&](const std::string& property_name) {
+          if (context.rfind("if array contains", 0) == 0) {
+            return "if array predicates require a direct sibling item property definition with "
+                   "const or enum: " +
+                   property_name +
+                   ". Hint: declare a sibling const/enum item domain in the base schema so "
+                   "xgrammar can enumerate the negative branch.";
+          }
+          return "if property predicates require a direct sibling property definition with const "
+                 "or enum: " +
+                 property_name +
+                 ". Hint: declare a sibling const/enum domain in the base schema so xgrammar "
+                 "can enumerate the negative branch.";
+        };
+        if (condition_value.is<bool>()) {
+          if (condition_value.get<bool>()) {
+            return ResultOk(ConditionAlternatives{fragment_ops.MakeEmpty(), {}});
+          }
+          return ResultOk(ConditionAlternatives{{}, fragment_ops.MakeEmpty()});
+        }
+        if (!condition_value.is<picojson::object>()) {
+          return ResultErr<SchemaError>(
+              SchemaErrorType::kInvalidSchema, context + " must be an object or boolean"
+          );
+        }
+        const auto& condition_obj = condition_value.get<picojson::object>();
         const picojson::object* current_base_properties = nullptr;
         std::unordered_set<std::string> base_required_names;
         if (available_base_schema != nullptr) {
@@ -1667,13 +2547,13 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         }
 
         for (const auto& key : condition_obj.ordered_keys()) {
-          if (key == "type" || key == "required" || key == "properties" ||
+          if (key == "type" || key == "required" || key == "properties" || key == "anyOf" ||
+              key == "allOf" || key == "not" ||
               kIgnoredKeys.count(key) != 0) {
             continue;
           }
           return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema,
-              "if only supports object required and properties with const/enum predicates"
+              make_unsupported_condition_keyword_error(context, key)
           );
         }
 
@@ -1695,8 +2575,16 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
           }
         }
 
-        std::vector<picojson::value> local_negative_reasons;
+        FragmentAlternatives local_negative_alternatives;
+        FragmentAlternatives local_nested_positive_alternatives = fragment_ops.MakeEmpty();
         std::unordered_set<std::string> local_predicate_names;
+        picojson::object positive_properties_obj;
+        bool positive_properties_initialized = false;
+        bool positive_properties_modified = false;
+        if (condition_obj.count("properties") && condition_obj.at("properties").is<picojson::object>()) {
+          positive_properties_obj = condition_obj.at("properties").get<picojson::object>();
+          positive_properties_initialized = true;
+        }
 
         if (condition_obj.count("properties")) {
           if (!condition_obj.at("properties").is<picojson::object>()) {
@@ -1709,15 +2597,13 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
             if (!local_required_names.count(property_name) &&
                 !base_required_names.count(property_name)) {
               return ResultErr<SchemaError>(
-                  SchemaErrorType::kInvalidSchema,
-                  "if property predicates must also be listed in required"
+                  make_required_membership_error(context, property_name, property_name)
               );
             }
             if (!current_base_properties || !current_base_properties->count(property_name)) {
               return ResultErr<SchemaError>(
                   SchemaErrorType::kInvalidSchema,
-                  "if property predicates require a direct sibling property definition with const or enum: " +
-                      property_name
+                  make_direct_sibling_domain_error(property_name)
               );
             }
 
@@ -1734,9 +2620,22 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
               }
               auto array_predicate = std::move(array_predicate_result).Unwrap();
               if (!base_required_names.count(property_name)) {
-                local_negative_reasons.push_back(make_absence_reason(property_name));
+                local_negative_alternatives.push_back({make_absence_reason(property_name)});
               }
-              local_negative_reasons.push_back(array_predicate.negative_present_fragment);
+              local_negative_alternatives.push_back(
+                  {array_predicate.negative_present_fragment}
+              );
+              positive_properties_obj.erase(property_name);
+              positive_properties_modified = true;
+              FragmentAlternatives wrapped_positive_alternatives;
+              for (const auto& positive_fragment : array_predicate.positive_fragments) {
+                wrapped_positive_alternatives.push_back(
+                    {make_required_property_fragment(property_name, positive_fragment)}
+                );
+              }
+              local_nested_positive_alternatives = fragment_ops.CrossProduct(
+                  local_nested_positive_alternatives, wrapped_positive_alternatives
+              );
               local_predicate_names.insert(property_name);
               continue;
             }
@@ -1744,30 +2643,54 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
             if (property_value.is<picojson::object>()) {
               const auto& property_obj = property_value.get<picojson::object>();
               bool is_nested_object_predicate =
-                  property_obj.count("required") || property_obj.count("properties");
+                  property_obj.count("required") || property_obj.count("properties") ||
+                  property_obj.count("anyOf") || property_obj.count("allOf") ||
+                  property_obj.count("not");
               if (is_nested_object_predicate &&
                   !property_obj.count("const") && !property_obj.count("enum") &&
                   !property_obj.count("contains")) {
                 if (!base_property_value.is<picojson::object>()) {
                   return ResultErr<SchemaError>(
                       SchemaErrorType::kInvalidSchema,
-                      "if property predicates require a direct sibling property definition with const or enum: " +
-                          property_name
+                      make_direct_sibling_domain_error(property_name)
                   );
                 }
                 const auto& base_property_obj = base_property_value.get<picojson::object>();
-                auto nested_result = parse_object_condition(
-                    property_obj, &base_property_obj, context + " property " + property_name
+                auto nested_result = parse_condition(
+                    property_value, &base_property_obj, context + " property " + property_name
                 );
                 if (nested_result.IsErr()) {
                   return ResultErr(std::move(nested_result).UnwrapErr());
                 }
+                auto nested_condition = std::move(nested_result).Unwrap();
                 if (!base_required_names.count(property_name)) {
-                  local_negative_reasons.push_back(make_absence_reason(property_name));
+                  local_negative_alternatives.push_back({make_absence_reason(property_name)});
                 }
-                for (const auto& nested_reason : std::move(nested_result).Unwrap()) {
-                  local_negative_reasons.push_back(
-                      make_required_property_fragment(property_name, nested_reason)
+                for (const auto& nested_negative_parts : nested_condition.negative_alternatives) {
+                  local_negative_alternatives.push_back(
+                      {make_required_property_fragment(
+                          property_name, combine_constraints(nested_negative_parts)
+                      )}
+                  );
+                }
+                if (property_obj.count("anyOf") || property_obj.count("allOf") ||
+                    property_obj.count("not")) {
+                  positive_properties_obj.erase(property_name);
+                  positive_properties_modified = true;
+                  FragmentAlternatives wrapped_positive_alternatives;
+                  for (const auto& nested_positive_parts : nested_condition.positive_alternatives) {
+                    if (nested_positive_parts.empty()) {
+                      wrapped_positive_alternatives.push_back({});
+                    } else {
+                      wrapped_positive_alternatives.push_back(
+                          {make_required_property_fragment(
+                              property_name, combine_constraints(nested_positive_parts)
+                          )}
+                      );
+                    }
+                  }
+                  local_nested_positive_alternatives = fragment_ops.CrossProduct(
+                      local_nested_positive_alternatives, wrapped_positive_alternatives
                   );
                 }
                 local_predicate_names.insert(property_name);
@@ -1775,19 +2698,39 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
               }
             }
 
-            auto positive_result = extract_finite_domain(property_value);
+            auto positive_result = extract_finite_domain(
+                property_value, context + " property " + quote_keyword(property_name), property_name
+            );
             if (positive_result.IsErr()) return ResultErr(std::move(positive_result).UnwrapErr());
             auto positive_values = std::move(positive_result).Unwrap();
 
-            auto domain_result = extract_finite_domain(base_property_value);
+            auto domain_result = extract_finite_domain(
+                base_property_value,
+                context + " sibling property " + quote_keyword(property_name),
+                property_name
+            );
             if (domain_result.IsErr()) {
               return ResultErr<SchemaError>(
                   SchemaErrorType::kInvalidSchema,
-                  "if property predicates require a direct sibling property definition with const or enum: " +
-                      property_name
+                  make_direct_sibling_domain_error(property_name)
               );
             }
             auto domain_values = std::move(domain_result).Unwrap();
+            std::vector<std::string> effective_positive_values;
+            for (const auto& positive_value : positive_values) {
+              if (std::find(domain_values.begin(), domain_values.end(), positive_value) !=
+                  domain_values.end()) {
+                effective_positive_values.push_back(positive_value);
+              }
+            }
+            if (effective_positive_values.empty()) {
+              return ResultOk(ConditionAlternatives{{}, fragment_ops.MakeEmpty()});
+            }
+            if (effective_positive_values.size() != positive_values.size()) {
+              positive_values = effective_positive_values;
+              positive_properties_obj[property_name] = make_finite_domain_schema(positive_values);
+              positive_properties_modified = true;
+            }
             std::vector<std::string> negative_values;
             for (const auto& domain_value : domain_values) {
               if (std::find(positive_values.begin(), positive_values.end(), domain_value) ==
@@ -1795,12 +2738,18 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
                 negative_values.push_back(domain_value);
               }
             }
+            if (negative_values.empty()) {
+              positive_properties_obj.erase(property_name);
+              positive_properties_modified = true;
+            }
 
             if (!base_required_names.count(property_name)) {
-              local_negative_reasons.push_back(make_absence_reason(property_name));
+              local_negative_alternatives.push_back({make_absence_reason(property_name)});
             }
             if (!negative_values.empty()) {
-              local_negative_reasons.push_back(make_value_reason(property_name, negative_values));
+              local_negative_alternatives.push_back(
+                  {make_value_reason(property_name, negative_values)}
+              );
             }
             local_predicate_names.insert(property_name);
           }
@@ -1809,19 +2758,129 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         for (const auto& required_name : local_required_names) {
           if (!local_predicate_names.count(required_name) &&
               !base_required_names.count(required_name)) {
-            local_negative_reasons.push_back(make_absence_reason(required_name));
+            local_negative_alternatives.push_back({make_absence_reason(required_name)});
           }
         }
 
-        return ResultOk(std::move(local_negative_reasons));
+        picojson::object local_fragment = condition_obj;
+        local_fragment.erase("anyOf");
+        local_fragment.erase("allOf");
+        local_fragment.erase("not");
+        if (positive_properties_initialized) {
+          if (positive_properties_modified) {
+            if (positive_properties_obj.empty()) {
+              local_fragment.erase("properties");
+            } else {
+              local_fragment["properties"] = picojson::value(positive_properties_obj);
+            }
+          }
+        }
+        if (local_fragment.size() == 1 && local_fragment.count("type") &&
+            local_fragment.at("type").is<std::string>() &&
+            local_fragment.at("type").get<std::string>() == "object") {
+          local_fragment.erase("type");
+        }
+
+        FragmentAlternatives positive_alternatives = fragment_ops.MakeEmpty();
+        if (!local_fragment.empty()) {
+          positive_alternatives = fragment_ops.MakeSingle(picojson::value(local_fragment));
+        }
+        positive_alternatives = fragment_ops.CrossProduct(
+            positive_alternatives, local_nested_positive_alternatives
+        );
+        FragmentAlternatives negative_alternatives = local_negative_alternatives;
+
+        if (condition_obj.count("allOf")) {
+          if (!condition_obj.at("allOf").is<picojson::array>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, context + " allOf must be an array"
+            );
+          }
+          ConditionAlternatives all_of_condition{fragment_ops.MakeEmpty(), {}};
+          for (size_t idx = 0; idx < condition_obj.at("allOf").get<picojson::array>().size(); ++idx) {
+            auto nested_result = parse_condition(
+                condition_obj.at("allOf").get<picojson::array>()[idx],
+                available_base_schema,
+                context + " allOf[" + std::to_string(idx) + "]"
+            );
+            if (nested_result.IsErr()) return ResultErr(std::move(nested_result).UnwrapErr());
+            auto nested_condition = std::move(nested_result).Unwrap();
+            all_of_condition.positive_alternatives = fragment_ops.CrossProduct(
+                all_of_condition.positive_alternatives, nested_condition.positive_alternatives
+            );
+            all_of_condition.negative_alternatives.insert(
+                all_of_condition.negative_alternatives.end(),
+                nested_condition.negative_alternatives.begin(),
+                nested_condition.negative_alternatives.end()
+            );
+          }
+          fragment_ops.ApplyConjunctiveComponent(
+              &positive_alternatives, &negative_alternatives, std::move(all_of_condition)
+          );
+        }
+
+        if (condition_obj.count("anyOf")) {
+          if (!condition_obj.at("anyOf").is<picojson::array>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, context + " anyOf must be an array"
+            );
+          }
+          ConditionAlternatives any_of_condition{{}, fragment_ops.MakeEmpty()};
+          for (size_t idx = 0; idx < condition_obj.at("anyOf").get<picojson::array>().size(); ++idx) {
+            auto nested_result = parse_condition(
+                condition_obj.at("anyOf").get<picojson::array>()[idx],
+                available_base_schema,
+                context + " anyOf[" + std::to_string(idx) + "]"
+            );
+            if (nested_result.IsErr()) return ResultErr(std::move(nested_result).UnwrapErr());
+            auto nested_condition = std::move(nested_result).Unwrap();
+            any_of_condition.positive_alternatives.insert(
+                any_of_condition.positive_alternatives.end(),
+                nested_condition.positive_alternatives.begin(),
+                nested_condition.positive_alternatives.end()
+            );
+            any_of_condition.negative_alternatives = fragment_ops.CrossProduct(
+                any_of_condition.negative_alternatives, nested_condition.negative_alternatives
+            );
+          }
+          fragment_ops.ApplyConjunctiveComponent(
+              &positive_alternatives, &negative_alternatives, std::move(any_of_condition)
+          );
+        }
+
+        if (condition_obj.count("not")) {
+          auto nested_result = parse_condition(
+              condition_obj.at("not"), available_base_schema, context + " not"
+          );
+          if (nested_result.IsErr()) return ResultErr(std::move(nested_result).UnwrapErr());
+          auto nested_condition = std::move(nested_result).Unwrap();
+          ConditionAlternatives negated_condition{
+              std::move(nested_condition.negative_alternatives),
+              std::move(nested_condition.positive_alternatives)};
+          fragment_ops.ApplyConjunctiveComponent(
+              &positive_alternatives, &negative_alternatives, std::move(negated_condition)
+          );
+        }
+
+        positive_alternatives = fragment_ops.Dedup(std::move(positive_alternatives));
+        negative_alternatives = fragment_ops.Dedup(std::move(negative_alternatives));
+        if (positive_alternatives.empty()) {
+          return ResultOk(ConditionAlternatives{{}, fragment_ops.MakeEmpty()});
+        }
+        if (negative_alternatives.empty()) {
+          return ResultOk(ConditionAlternatives{fragment_ops.MakeEmpty(), {}});
+        }
+        return ResultOk(
+            ConditionAlternatives{std::move(positive_alternatives), std::move(negative_alternatives)}
+        );
       };
 
-  auto negative_reasons_result = parse_object_condition(if_obj, &base_schema, "if");
-  if (negative_reasons_result.IsErr()) {
-    return ResultErr(std::move(negative_reasons_result).UnwrapErr());
+  auto condition_result = parse_condition(if_value, &base_schema, "if");
+  if (condition_result.IsErr()) {
+    return ResultErr(std::move(condition_result).UnwrapErr());
   }
-  std::vector<picojson::value> negative_reasons = std::move(negative_reasons_result).Unwrap();
-  bool condition_implied_by_base = negative_reasons.empty();
+  auto condition = std::move(condition_result).Unwrap();
+  bool condition_implied_by_base = condition.negative_alternatives.empty();
 
   auto is_object_like_schema = [](const picojson::object& obj) {
     return obj.count("type") || obj.count("properties") || obj.count("required") ||
@@ -1836,7 +2895,6 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
         "if/then/else is only supported on object schemas in this implementation"
     );
   }
-
   std::function<Result<bool, SchemaError>(
       const picojson::value&, std::vector<std::vector<std::string>>*)>
       parse_not_groups =
@@ -2188,9 +3246,14 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
   };
 
   std::vector<SchemaSpecPtr> branch_options;
+  std::unordered_set<std::string> seen_branch_schema_keys;
   size_t branch_index = 0;
   auto append_branch_option =
       [&](const picojson::value& branch_schema) -> Result<bool, SchemaError> {
+    std::string branch_schema_key = ComputeCacheKey(branch_schema);
+    if (!seen_branch_schema_keys.insert(branch_schema_key).second) {
+      return ResultOk(false);
+    }
     auto parse_result =
         Parse(branch_schema, rule_name_hint + "_branch_" + std::to_string(branch_index++));
     if (parse_result.IsErr()) {
@@ -2216,24 +3279,25 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
       }
     }
     if (include_positive_branch) {
-      for (const auto& positive_fragment : positive_alternatives) {
-        std::vector<picojson::value> positive_parts;
-        if (!condition_implied_by_base) {
-          positive_parts.push_back(if_value);
+      FragmentAlternatives condition_positive_alternatives =
+          condition_implied_by_base ? fragment_ops.MakeEmpty() : condition.positive_alternatives;
+      for (const auto& condition_positive_parts : condition_positive_alternatives) {
+        for (const auto& positive_fragment : positive_alternatives) {
+          std::vector<picojson::value> positive_parts = condition_positive_parts;
+          if (positive_fragment.is<picojson::object>() &&
+              !positive_fragment.get<picojson::object>().empty()) {
+            positive_parts.push_back(positive_fragment);
+          }
+          auto branch_result = make_branch(positive_parts, "then");
+          if (branch_result.IsErr()) return ResultErr(std::move(branch_result).UnwrapErr());
+          auto append_result = append_branch_option(std::move(branch_result).Unwrap());
+          if (append_result.IsErr()) return ResultErr(std::move(append_result).UnwrapErr());
         }
-        if (positive_fragment.is<picojson::object>() &&
-            !positive_fragment.get<picojson::object>().empty()) {
-          positive_parts.push_back(positive_fragment);
-        }
-        auto branch_result = make_branch(positive_parts, "then");
-        if (branch_result.IsErr()) return ResultErr(std::move(branch_result).UnwrapErr());
-        auto append_result = append_branch_option(std::move(branch_result).Unwrap());
-        if (append_result.IsErr()) return ResultErr(std::move(append_result).UnwrapErr());
       }
     }
   }
   std::vector<picojson::value> else_alternatives = {picojson::value(picojson::object{})};
-  bool include_else_branch = !negative_reasons.empty();
+  bool include_else_branch = !condition.negative_alternatives.empty();
   if (schema.count("else")) {
     if (schema.at("else").is<bool>()) {
       include_else_branch = include_else_branch && schema.at("else").get<bool>();
@@ -2244,14 +3308,13 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::ParseConditional(
     }
   }
   if (include_else_branch) {
-    for (const auto& negative_reason : negative_reasons) {
+    for (const auto& negative_parts : condition.negative_alternatives) {
       for (const auto& else_fragment : else_alternatives) {
-        std::vector<picojson::value> negative_parts = {negative_reason};
-        if (else_fragment.is<picojson::object>() &&
-            !else_fragment.get<picojson::object>().empty()) {
-          negative_parts.push_back(else_fragment);
+        std::vector<picojson::value> branch_parts = negative_parts;
+        if (else_fragment.is<picojson::object>() && !else_fragment.get<picojson::object>().empty()) {
+          branch_parts.push_back(else_fragment);
         }
-        auto branch_result = make_branch(negative_parts, "else");
+        auto branch_result = make_branch(branch_parts, "else");
         if (branch_result.IsErr()) return ResultErr(std::move(branch_result).UnwrapErr());
         auto append_result = append_branch_option(std::move(branch_result).Unwrap());
         if (append_result.IsErr()) return ResultErr(std::move(append_result).UnwrapErr());
@@ -2382,6 +3445,12 @@ Result<ObjectSpec, SchemaError> SchemaParser::MergeObjectSpecs(
   }
   for (const auto& group : rhs.forbidden_groups) {
     merged.forbidden_groups.push_back(group);
+  }
+  for (const auto& exclusion : lhs.forbidden_property_values) {
+    PushBackUnique(&merged.forbidden_property_values, exclusion);
+  }
+  for (const auto& exclusion : rhs.forbidden_property_values) {
+    PushBackUnique(&merged.forbidden_property_values, exclusion);
   }
 
   auto lhs_fallback = get_fallback_schema(lhs);
@@ -2538,28 +3607,48 @@ Result<ArraySpec, SchemaError> SchemaParser::MergeArraySpecs(
     );
   }
 
-  if (lhs.contains_item || rhs.contains_item) {
+  if (!lhs.contains_items.empty() || !rhs.contains_items.empty()) {
     if (!merged.prefix_items.empty() || !merged.allow_additional_items) {
       return ResultErr<SchemaError>(
           SchemaErrorType::kInvalidSchema,
           "contains is only supported for homogeneous arrays without prefixItems"
       );
     }
-    SchemaSpecPtr contains_spec = lhs.contains_item ? lhs.contains_item : rhs.contains_item;
-    if (lhs.contains_item && rhs.contains_item) {
-      auto contains_merge =
-          MergeSchemaSpecs(lhs.contains_item, rhs.contains_item, rule_name_hint + "_contains");
-      if (contains_merge.IsErr()) return ResultErr(std::move(contains_merge).UnwrapErr());
-      contains_spec = std::move(contains_merge).Unwrap();
+    std::vector<SchemaSpecPtr> contains_specs;
+    contains_specs.reserve(lhs.contains_items.size() + rhs.contains_items.size());
+    std::unordered_set<std::string> seen_contains_keys;
+    std::unordered_map<const SchemaSpec*, std::string> contains_key_cache;
+    auto get_contains_key = [&](const SchemaSpecPtr& contains_spec) -> const std::string& {
+      auto [it, inserted] = contains_key_cache.try_emplace(contains_spec.get());
+      if (inserted) {
+        it->second = StructuralSchemaKey(contains_spec);
+      }
+      return it->second;
+    };
+    auto append_unique_contains = [&](const SchemaSpecPtr& contains_spec) {
+      if (!seen_contains_keys.insert(get_contains_key(contains_spec)).second) {
+        return;
+      }
+      contains_specs.push_back(contains_spec);
+    };
+    for (const auto& contains_spec : lhs.contains_items) {
+      append_unique_contains(contains_spec);
     }
-    if (merged.additional_items) {
-      auto contains_merge = MergeSchemaSpecs(
-          merged.additional_items, contains_spec, rule_name_hint + "_contains_additional"
-      );
-      if (contains_merge.IsErr()) return ResultErr(std::move(contains_merge).UnwrapErr());
-      merged.contains_item = std::move(contains_merge).Unwrap();
-    } else {
-      merged.contains_item = std::move(contains_spec);
+    for (const auto& contains_spec : rhs.contains_items) {
+      append_unique_contains(contains_spec);
+    }
+    for (size_t idx = 0; idx < contains_specs.size(); ++idx) {
+      if (merged.additional_items) {
+        auto contains_merge = MergeSchemaSpecs(
+            merged.additional_items,
+            contains_specs[idx],
+            rule_name_hint + "_contains_additional_" + std::to_string(idx)
+        );
+        if (contains_merge.IsErr()) return ResultErr(std::move(contains_merge).UnwrapErr());
+        merged.contains_items.push_back(std::move(contains_merge).Unwrap());
+      } else {
+        merged.contains_items.push_back(std::move(contains_specs[idx]));
+      }
     }
   }
 
@@ -3114,15 +4203,18 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
     const std::string& rule_name_hint,
     std::optional<std::string> default_type
 ) {
+  auto finish_err = [&](SchemaError err) -> Result<SchemaSpecPtr, SchemaError> {
+    return ResultErr<SchemaError>(AnnotateSchemaError(std::move(err)));
+  };
   std::string cache_key = ComputeCacheKey(schema);
-  if (schema_cache_.count(cache_key)) {
-    return ResultOk(schema_cache_[cache_key]);
+  if (auto it = schema_cache_.find(cache_key); it != schema_cache_.end()) {
+    return ResultOk(it->second);
   }
 
   if (schema.is<bool>()) {
     if (!schema.get<bool>()) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kUnsatisfiableSchema, "Schema 'false' cannot accept any value"
+      return finish_err(
+          SchemaError(SchemaErrorType::kUnsatisfiableSchema, "Schema 'false' cannot accept any value")
       );
     }
     auto spec = SchemaSpec::Make(AnySpec{}, cache_key, rule_name_hint);
@@ -3131,18 +4223,33 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
   }
 
   if (!schema.is<picojson::object>()) {
-    return ResultErr<SchemaError>(
+    return finish_err(SchemaError(
         SchemaErrorType::kInvalidSchema,
         "Schema should be an object or bool, but got " + schema.serialize(false)
-    );
+    ));
   }
 
   const auto& schema_obj = schema.get<picojson::object>();
   if (schema_obj.count("dependentSchemas")) {
     auto rewrite_result = RewriteDependentSchemasAsAllOf(schema_obj);
-    if (rewrite_result.IsErr()) return ResultErr(std::move(rewrite_result).UnwrapErr());
+    if (rewrite_result.IsErr()) return finish_err(std::move(rewrite_result).UnwrapErr());
     auto rewritten_result = Parse(std::move(rewrite_result).Unwrap(), rule_name_hint, default_type);
-    if (rewritten_result.IsErr()) return ResultErr(std::move(rewritten_result).UnwrapErr());
+    if (rewritten_result.IsErr()) return finish_err(std::move(rewritten_result).UnwrapErr());
+    auto rewritten_spec = std::move(rewritten_result).Unwrap();
+    rewritten_spec->cache_key = cache_key;
+    rewritten_spec->rule_name_hint = rule_name_hint;
+    schema_cache_[cache_key] = rewritten_spec;
+    return ResultOk(rewritten_spec);
+  }
+
+  auto not_rewrite_result = TryRewriteObjectNotAsConditional(schema_obj);
+  if (not_rewrite_result.IsErr()) return finish_err(std::move(not_rewrite_result).UnwrapErr());
+  auto not_rewrite_opt = std::move(not_rewrite_result).Unwrap();
+  if (not_rewrite_opt.has_value()) {
+    auto rewritten_result = Parse(
+        picojson::value(std::move(not_rewrite_opt).value()), rule_name_hint, default_type
+    );
+    if (rewritten_result.IsErr()) return finish_err(std::move(rewritten_result).UnwrapErr());
     auto rewritten_spec = std::move(rewritten_result).Unwrap();
     rewritten_spec->cache_key = cache_key;
     rewritten_spec->rule_name_hint = rule_name_hint;
@@ -3154,79 +4261,81 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
 
   if (schema_obj.count("if") || schema_obj.count("then") || schema_obj.count("else")) {
     auto conditional_result = ParseConditional(schema_obj, rule_name_hint);
-    if (conditional_result.IsErr()) return ResultErr(std::move(conditional_result).UnwrapErr());
+    if (conditional_result.IsErr()) return finish_err(std::move(conditional_result).UnwrapErr());
     result = std::move(conditional_result).Unwrap();
     result->cache_key = cache_key;
     result->rule_name_hint = rule_name_hint;
   } else if (schema_obj.count("$ref")) {
     auto ref_result = ParseRef(schema_obj);
-    if (ref_result.IsErr()) return ResultErr(std::move(ref_result).UnwrapErr());
+    if (ref_result.IsErr()) return finish_err(std::move(ref_result).UnwrapErr());
     auto ref_spec = std::move(ref_result).Unwrap();
     result = SchemaSpec::Make(std::move(ref_spec), cache_key, rule_name_hint);
   } else if (schema_obj.count("const")) {
     auto const_result = ParseConst(schema_obj);
-    if (const_result.IsErr()) return ResultErr(std::move(const_result).UnwrapErr());
+    if (const_result.IsErr()) return finish_err(std::move(const_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(const_result).Unwrap(), cache_key, rule_name_hint);
   } else if (schema_obj.count("enum")) {
     auto enum_result = ParseEnum(schema_obj);
-    if (enum_result.IsErr()) return ResultErr(std::move(enum_result).UnwrapErr());
+    if (enum_result.IsErr()) return finish_err(std::move(enum_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(enum_result).Unwrap(), cache_key, rule_name_hint);
   } else if (schema_obj.count("anyOf")) {
     auto anyof_result = ParseAnyOf(schema_obj);
-    if (anyof_result.IsErr()) return ResultErr(std::move(anyof_result).UnwrapErr());
+    if (anyof_result.IsErr()) return finish_err(std::move(anyof_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(anyof_result).Unwrap(), cache_key, rule_name_hint);
   } else if (schema_obj.count("oneOf")) {
     auto oneof_result = ParseOneOf(schema_obj, rule_name_hint);
-    if (oneof_result.IsErr()) return ResultErr(std::move(oneof_result).UnwrapErr());
+    if (oneof_result.IsErr()) return finish_err(std::move(oneof_result).UnwrapErr());
     result = std::move(oneof_result).Unwrap();
     result->cache_key = cache_key;
     result->rule_name_hint = rule_name_hint;
   } else if (schema_obj.count("allOf")) {
     auto allof_result = ParseAllOf(schema_obj);
-    if (allof_result.IsErr()) return ResultErr(std::move(allof_result).UnwrapErr());
+    if (allof_result.IsErr()) return finish_err(std::move(allof_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(allof_result).Unwrap(), cache_key, rule_name_hint);
   } else if (schema_obj.count("type") || default_type.has_value()) {
     if (schema_obj.count("type") && schema_obj.at("type").is<picojson::array>()) {
       auto type_array_result = ParseTypeArray(schema_obj, rule_name_hint);
-      if (type_array_result.IsErr()) return ResultErr(std::move(type_array_result).UnwrapErr());
+      if (type_array_result.IsErr()) return finish_err(std::move(type_array_result).UnwrapErr());
       result = SchemaSpec::Make(std::move(type_array_result).Unwrap(), cache_key, rule_name_hint);
     } else {
       if (schema_obj.count("type") && !schema_obj.at("type").is<std::string>()) {
-        return ResultErr<SchemaError>(SchemaErrorType::kInvalidSchema, "Type should be a string");
+        return finish_err(
+            SchemaError(SchemaErrorType::kInvalidSchema, "Type should be a string")
+        );
       }
       const std::string& type = schema_obj.count("type") ? schema_obj.at("type").get<std::string>()
                                                          : default_type.value();
       if (type == "integer") {
         auto int_result = ParseInteger(schema_obj);
-        if (int_result.IsErr()) return ResultErr(std::move(int_result).UnwrapErr());
+        if (int_result.IsErr()) return finish_err(std::move(int_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(int_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "number") {
         auto num_result = ParseNumber(schema_obj);
-        if (num_result.IsErr()) return ResultErr(std::move(num_result).UnwrapErr());
+        if (num_result.IsErr()) return finish_err(std::move(num_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(num_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "string") {
         auto str_result = ParseString(schema_obj);
-        if (str_result.IsErr()) return ResultErr(std::move(str_result).UnwrapErr());
+        if (str_result.IsErr()) return finish_err(std::move(str_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(str_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "boolean") {
         auto bool_result = ParseBoolean(schema_obj);
-        if (bool_result.IsErr()) return ResultErr(std::move(bool_result).UnwrapErr());
+        if (bool_result.IsErr()) return finish_err(std::move(bool_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(bool_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "null") {
         auto null_result = ParseNull(schema_obj);
-        if (null_result.IsErr()) return ResultErr(std::move(null_result).UnwrapErr());
+        if (null_result.IsErr()) return finish_err(std::move(null_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(null_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "array") {
         auto array_result = ParseArray(schema_obj);
-        if (array_result.IsErr()) return ResultErr(std::move(array_result).UnwrapErr());
+        if (array_result.IsErr()) return finish_err(std::move(array_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(array_result).Unwrap(), cache_key, rule_name_hint);
       } else if (type == "object") {
         auto obj_result = ParseObject(schema_obj);
-        if (obj_result.IsErr()) return ResultErr(std::move(obj_result).UnwrapErr());
+        if (obj_result.IsErr()) return finish_err(std::move(obj_result).UnwrapErr());
         result = SchemaSpec::Make(std::move(obj_result).Unwrap(), cache_key, rule_name_hint);
       } else {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "Unsupported type \"" + type + "\""
+        return finish_err(
+            SchemaError(SchemaErrorType::kInvalidSchema, "Unsupported type \"" + type + "\"")
         );
       }
     }
@@ -3236,12 +4345,13 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::Parse(
              schema_obj.count("additionalProperties") || schema_obj.count("unevaluatedProperties") ||
              schema_obj.count("minProperties") || schema_obj.count("maxProperties")) {
     auto obj_result = ParseObject(schema_obj);
-    if (obj_result.IsErr()) return ResultErr(std::move(obj_result).UnwrapErr());
+    if (obj_result.IsErr()) return finish_err(std::move(obj_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(obj_result).Unwrap(), cache_key, rule_name_hint);
   } else if (schema_obj.count("items") || schema_obj.count("prefixItems") ||
-             schema_obj.count("unevaluatedItems")) {
+             schema_obj.count("unevaluatedItems") || schema_obj.count("contains") ||
+             schema_obj.count("minContains") || schema_obj.count("maxContains")) {
     auto array_result = ParseArray(schema_obj);
-    if (array_result.IsErr()) return ResultErr(std::move(array_result).UnwrapErr());
+    if (array_result.IsErr()) return finish_err(std::move(array_result).UnwrapErr());
     result = SchemaSpec::Make(std::move(array_result).Unwrap(), cache_key, rule_name_hint);
   } else {
     result = SchemaSpec::Make(AnySpec{}, cache_key, rule_name_hint);
@@ -3435,6 +4545,7 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
           SchemaErrorType::kInvalidSchema, "prefixItems must be an array"
       );
     }
+    int64_t idx = 0;
     for (const auto& item : schema.at("prefixItems").get<picojson::array>()) {
       if (item.is<bool>() && !item.get<bool>()) {
         return ResultErr<SchemaError>(
@@ -3445,9 +4556,12 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
             SchemaErrorType::kInvalidSchema, "prefixItems must be an array of objects or booleans"
         );
       }
-      auto item_result = Parse(item, "prefix_item");
+      auto item_result = WithSchemaPath({"prefixItems", std::to_string(idx)}, [&]() {
+        return Parse(item, "prefix_item");
+      });
       if (item_result.IsErr()) return ResultErr(std::move(item_result).UnwrapErr());
       spec.prefix_items.push_back(std::move(item_result).Unwrap());
+      ++idx;
     }
   }
 
@@ -3462,7 +4576,7 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
       spec.allow_additional_items = false;
     } else {
       spec.allow_additional_items = true;
-      auto items_result = Parse(items_value, "item");
+      auto items_result = WithSchemaPath({"items"}, [&]() { return Parse(items_value, "item"); });
       if (items_result.IsErr()) return ResultErr(std::move(items_result).UnwrapErr());
       spec.additional_items = std::move(items_result).Unwrap();
     }
@@ -3477,7 +4591,9 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
       spec.allow_additional_items = false;
     } else {
       spec.allow_additional_items = true;
-      auto items_result = Parse(unevaluated_items_value, "unevaluated_item");
+      auto items_result = WithSchemaPath({"unevaluatedItems"}, [&]() {
+        return Parse(unevaluated_items_value, "unevaluated_item");
+      });
       if (items_result.IsErr()) return ResultErr(std::move(items_result).UnwrapErr());
       spec.additional_items = std::move(items_result).Unwrap();
     }
@@ -3585,7 +4701,8 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
       }
       contains_spec = spec.additional_items ? spec.additional_items : SchemaSpec::Make(AnySpec{}, "", "any");
     } else if (contains_value.is<picojson::object>()) {
-      auto contains_result = Parse(contains_value, "contains_item");
+      auto contains_result =
+          WithSchemaPath({"contains"}, [&]() { return Parse(contains_value, "contains_item"); });
       if (contains_result.IsErr()) return ResultErr(std::move(contains_result).UnwrapErr());
       contains_spec = std::move(contains_result).Unwrap();
     } else {
@@ -3597,9 +4714,9 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
     if (spec.additional_items) {
       auto merge_result = MergeSchemaSpecs(spec.additional_items, contains_spec, "contains_item");
       if (merge_result.IsErr()) return ResultErr(std::move(merge_result).UnwrapErr());
-      spec.contains_item = std::move(merge_result).Unwrap();
+      spec.contains_items.push_back(std::move(merge_result).Unwrap());
     } else {
-      spec.contains_item = std::move(contains_spec);
+      spec.contains_items.push_back(std::move(contains_spec));
     }
     spec.min_contains = 1;
   } else if (schema.count("minContains")) {
@@ -3623,7 +4740,6 @@ Result<ArraySpec, SchemaError> SchemaParser::ParseArray(const picojson::object& 
 
 Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object& schema) {
   ObjectSpec spec;
-
   if (schema.count("properties")) {
     if (!schema.at("properties").is<picojson::object>()) {
       return ResultErr<SchemaError>(
@@ -3632,7 +4748,8 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
     }
     auto properties_obj = schema.at("properties").get<picojson::object>();
     for (const auto& key : properties_obj.ordered_keys()) {
-      auto prop_result = Parse(properties_obj.at(key), key);
+      auto prop_result =
+          WithSchemaPath({"properties", key}, [&]() { return Parse(properties_obj.at(key), key); });
       if (prop_result.IsErr()) return ResultErr(std::move(prop_result).UnwrapErr());
       spec.properties.push_back({key, std::move(prop_result).Unwrap()});
     }
@@ -3670,9 +4787,7 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
           );
         }
         const auto& dep_name = dep.get<std::string>();
-        if (std::find(deps.begin(), deps.end(), dep_name) == deps.end()) {
-          deps.push_back(dep_name);
-        }
+        PushBackUnique(&deps, dep_name);
       }
       if (!deps.empty()) {
         spec.dependent_required[key] = std::move(deps);
@@ -3681,131 +4796,19 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
   }
 
   if (schema.count("not")) {
-    auto parse_required_only_object =
-        [](const picojson::value& value, const std::string& context
-        ) -> Result<std::vector<std::string>, SchemaError> {
-      if (!value.is<picojson::object>()) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, context + " must be an object"
-        );
-      }
-      const auto& obj = value.get<picojson::object>();
-      static const std::unordered_set<std::string> kIgnoredKeys = {
-          "title",
-          "default",
-          "description",
-          "examples",
-          "deprecated",
-          "readOnly",
-          "writeOnly",
-          "$comment",
-      };
-      bool has_required = obj.count("required");
-      if (!has_required) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, context + " must contain required"
-        );
-      }
-      for (const auto& key : obj.ordered_keys()) {
-        if (key == "required" || key == "type" || kIgnoredKeys.count(key) != 0) {
-          continue;
-        }
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema,
-            context + " only supports required with optional type=object"
-        );
-      }
-      if (obj.count("type")) {
-        if (!obj.at("type").is<std::string>() || obj.at("type").get<std::string>() != "object") {
-          return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema, context + " type must be object"
-          );
-        }
-      }
-      if (!obj.at("required").is<picojson::array>()) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, context + " required must be an array"
-        );
-      }
-      std::vector<std::string> group;
-      for (const auto& item : obj.at("required").get<picojson::array>()) {
-        if (!item.is<std::string>()) {
-          return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema,
-              context + " required must contain only strings"
-          );
-        }
-        const auto& name = item.get<std::string>();
-        if (std::find(group.begin(), group.end(), name) == group.end()) {
-          group.push_back(name);
-        }
-      }
-      return ResultOk(std::move(group));
-    };
-
     const auto& not_value = schema.at("not");
-    if (!not_value.is<picojson::object>()) {
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema, "object not must be an object"
-      );
-    }
-    const auto& not_obj = not_value.get<picojson::object>();
-    static const std::unordered_set<std::string> kIgnoredNotKeys = {
-        "title",
-        "default",
-        "description",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "$comment",
-    };
-    auto validate_not_container_keys =
-        [&](bool allow_required, bool allow_anyof) -> Result<bool, SchemaError> {
-      for (const auto& key : not_obj.ordered_keys()) {
-        if ((allow_required && key == "required") || (allow_anyof && key == "anyOf") ||
-            key == "type" || kIgnoredNotKeys.count(key) != 0) {
-          continue;
-        }
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema,
-            "object not only supports required or anyOf of required groups"
-        );
-      }
-      if (not_obj.count("type")) {
-        if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
-          return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema, "object not type must be object"
-          );
-        }
-      }
-      return ResultOk(true);
-    };
-
-    if (not_obj.count("required")) {
-      auto validate_result = validate_not_container_keys(/*allow_required=*/true, /*allow_anyof=*/false);
-      if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
-      auto group_result = parse_required_only_object(not_value, "not");
-      if (group_result.IsErr()) return ResultErr(std::move(group_result).UnwrapErr());
-      spec.forbidden_groups.push_back(std::move(group_result).Unwrap());
-    } else if (not_obj.count("anyOf")) {
-      auto validate_result = validate_not_container_keys(/*allow_required=*/false, /*allow_anyof=*/true);
-      if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
-      if (!not_obj.at("anyOf").is<picojson::array>()) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "not anyOf must be an array"
-        );
-      }
-      for (const auto& option : not_obj.at("anyOf").get<picojson::array>()) {
-        auto group_result = parse_required_only_object(option, "not anyOf entry");
-        if (group_result.IsErr()) return ResultErr(std::move(group_result).UnwrapErr());
-        spec.forbidden_groups.push_back(std::move(group_result).Unwrap());
-      }
-    } else {
+    auto parsed_not_entries = TryParseSupportedObjectNotEntries(not_value);
+    if (!parsed_not_entries.has_value()) {
       return ResultErr<SchemaError>(
           SchemaErrorType::kInvalidSchema,
-          "object not only supports required or anyOf of required groups"
+          "object not only supports required groups, or required property const/enum predicates, or anyOf of those"
       );
+    }
+    for (auto& parsed_not_entry : *parsed_not_entries) {
+      auto apply_result = ApplyParsedObjectNotEntryToObjectSpec(&spec, std::move(parsed_not_entry));
+      if (apply_result.IsErr()) {
+        return ResultErr(std::move(apply_result).UnwrapErr());
+      }
     }
   }
 
@@ -3817,7 +4820,9 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
     }
     auto pattern_props = schema.at("patternProperties").get<picojson::object>();
     for (const auto& key : pattern_props.ordered_keys()) {
-      auto prop_result = Parse(pattern_props.at(key), "pattern_prop");
+      auto prop_result = WithSchemaPath({"patternProperties", key}, [&]() {
+        return Parse(pattern_props.at(key), "pattern_prop");
+      });
       if (prop_result.IsErr()) return ResultErr(std::move(prop_result).UnwrapErr());
       spec.pattern_properties.push_back({key, std::move(prop_result).Unwrap()});
     }
@@ -3837,7 +4842,9 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
           "propertyNames must be an object that validates string"
       );
     }
-    auto prop_names_result = Parse(schema.at("propertyNames"), "property_name", "string");
+    auto prop_names_result = WithSchemaPath({"propertyNames"}, [&]() {
+      return Parse(schema.at("propertyNames"), "property_name", "string");
+    });
     if (prop_names_result.IsErr()) return ResultErr(std::move(prop_names_result).UnwrapErr());
     spec.property_names = std::move(prop_names_result).Unwrap();
   }
@@ -3849,7 +4856,9 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
       spec.allow_additional_properties = add_props.get<bool>();
     } else {
       spec.allow_additional_properties = true;
-      auto add_props_result = Parse(add_props, "additional");
+      auto add_props_result = WithSchemaPath({"additionalProperties"}, [&]() {
+        return Parse(add_props, "additional");
+      });
       if (add_props_result.IsErr()) return ResultErr(std::move(add_props_result).UnwrapErr());
       spec.additional_properties_schema = std::move(add_props_result).Unwrap();
     }
@@ -3864,7 +4873,9 @@ Result<ObjectSpec, SchemaError> SchemaParser::ParseObject(const picojson::object
       spec.allow_unevaluated_properties = uneval_props.get<bool>();
     } else {
       spec.allow_unevaluated_properties = true;
-      auto uneval_result = Parse(uneval_props, "unevaluated");
+      auto uneval_result = WithSchemaPath({"unevaluatedProperties"}, [&]() {
+        return Parse(uneval_props, "unevaluated");
+      });
       if (uneval_result.IsErr()) return ResultErr(std::move(uneval_result).UnwrapErr());
       spec.unevaluated_properties_schema = std::move(uneval_result).Unwrap();
     }
@@ -3955,7 +4966,9 @@ Result<RefSpec, SchemaError> SchemaParser::ParseRef(const picojson::object& sche
 Result<SchemaSpecPtr, SchemaError> SchemaParser::ResolveRef(
     const std::string& uri, const std::string& rule_name_hint
 ) {
-  if (ref_cache_.count(uri)) return ResultOk(ref_cache_[uri]);
+  if (auto it = ref_cache_.find(uri); it != ref_cache_.end()) {
+    return ResultOk(it->second);
+  }
 
   if (uri == "#") {
     auto placeholder = SchemaSpec::Make(AnySpec{}, "", "root");
@@ -4024,6 +5037,7 @@ Result<std::vector<SchemaSpecPtr>, SchemaError> SchemaParser::ParseCompositeOpti
   std::vector<SchemaSpecPtr> options;
   int idx = 0;
   for (const auto& option : schema.at(keyword).get<picojson::array>()) {
+    bool parse_with_embedded_base = false;
     picojson::value option_to_parse = option;
     if (keyword == "anyOf" && base_spec.has_value() && option.is<picojson::object>() &&
         std::holds_alternative<ObjectSpec>((*base_spec)->spec)) {
@@ -4038,14 +5052,21 @@ Result<std::vector<SchemaSpecPtr>, SchemaError> SchemaParser::ParseCompositeOpti
            option_obj.count("not") || option_obj.count("minProperties") ||
            option_obj.count("maxProperties"));
       if (has_concrete_base_properties && is_required_only_fragment) {
-        option_to_parse = NormalizePartialObjectFragment(option);
+        picojson::array all_of = {
+            picojson::value(base_schema), NormalizePartialObjectFragment(option)};
+        picojson::object combined_schema;
+        combined_schema["allOf"] = picojson::value(all_of);
+        option_to_parse = picojson::value(combined_schema);
+        parse_with_embedded_base = true;
       }
     }
 
-    auto option_result = Parse(option_to_parse, rule_name_prefix + "_" + std::to_string(idx));
+    auto option_result = WithSchemaPath({keyword, std::to_string(idx)}, [&]() {
+      return Parse(option_to_parse, rule_name_prefix + "_" + std::to_string(idx));
+    });
     if (option_result.IsErr()) return ResultErr(std::move(option_result).UnwrapErr());
     auto option_spec = std::move(option_result).Unwrap();
-    if (base_spec.has_value()) {
+    if (base_spec.has_value() && !parse_with_embedded_base) {
       auto merge_result = MergeSchemaSpecs(
           *base_spec, option_spec, rule_name_prefix + "_merged_" + std::to_string(idx)
       );
@@ -4121,10 +5142,7 @@ Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiv
             SchemaErrorType::kInvalidSchema, context + " must contain only strings"
         );
       }
-      const auto& name = item.get<std::string>();
-      if (std::find(group.begin(), group.end(), name) == group.end()) {
-        group.push_back(name);
-      }
+      PushBackUnique(&group, item.get<std::string>());
     }
     return ResultOk(std::move(group));
   };
@@ -4132,170 +5150,336 @@ Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiv
   struct PresencePredicate {
     std::vector<std::string> required_group;
     std::vector<std::vector<std::string>> forbidden_groups;
+    std::vector<std::pair<std::string, std::vector<std::string>>> dependent_required;
+    std::vector<std::pair<std::string, std::vector<std::string>>> forbidden_property_values;
     std::vector<ObjectSpec::Property> property_refinements;
   };
 
   std::vector<PresencePredicate> predicates;
   std::vector<std::string> involved_properties;
   auto append_unique_name = [](std::vector<std::string>* names, const std::string& name) {
-    if (std::find(names->begin(), names->end(), name) == names->end()) {
-      names->push_back(name);
-    }
+    PushBackUnique(names, name);
   };
   auto is_ignorable_option_key = [](const std::string& key) {
-    static const std::unordered_set<std::string> kIgnoredKeys = {
-        "title",
-        "default",
-        "description",
-        "examples",
-        "deprecated",
-        "readOnly",
-        "writeOnly",
-        "$comment",
-    };
+    const auto& kIgnoredKeys = IgnoredSchemaAnnotationKeys();
     return kIgnoredKeys.count(key) != 0;
   };
-  auto parse_supported_not_groups =
-      [&](const picojson::value& value) -> Result<std::vector<std::vector<std::string>>, SchemaError> {
+  struct NotPredicateConstraints {
+    std::vector<std::vector<std::string>> forbidden_groups;
+    std::vector<std::pair<std::string, std::vector<std::string>>> forbidden_property_values;
+  };
+  auto validate_oneof_not_container_keys =
+      [&](const picojson::object& not_obj,
+          bool allow_required,
+          bool allow_anyof) -> Result<bool, SchemaError> {
+    for (const auto& key : not_obj.ordered_keys()) {
+      if ((allow_required && key == "required") || (allow_anyof && key == "anyOf") ||
+          key == "properties" || key == "type" || is_ignorable_option_key(key)) {
+        continue;
+      }
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          "oneOf not branch only supports required groups, or required property const/enum predicates, or anyOf of those"
+      );
+    }
+    if (not_obj.count("type")) {
+      if (!not_obj.at("type").is<std::string>() ||
+          not_obj.at("type").get<std::string>() != "object") {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema, "oneOf not branch type must be object"
+        );
+      }
+    }
+    return ResultOk(true);
+  };
+  auto parse_oneof_not_entry =
+      [&](const picojson::object& entry_obj,
+          bool from_any_of) -> Result<ParsedObjectNotEntry, SchemaError> {
+    auto parsed_entry_result = ParseSupportedFiniteNotEntry(
+        entry_obj,
+        from_any_of ? "oneOf not anyOf entry" : "oneOf not branch",
+        from_any_of
+            ? "oneOf not anyOf entry only supports required groups or single required property const/enum predicates"
+            : "oneOf not branch only supports required groups or single required property const/enum predicates",
+        [&](const std::string&) {
+          return from_any_of
+                     ? "oneOf not anyOf entry property predicate only supports const or enum"
+                     : "oneOf not branch property predicate only supports const or enum";
+        },
+        from_any_of ? "oneOf not anyOf entry property predicate must be an object"
+                    : "oneOf not branch property predicate must be an object",
+        from_any_of ? "oneOf not anyOf entry property predicate enum must be an array"
+                    : "oneOf not branch property predicate enum must be an array",
+        from_any_of ? "oneOf not anyOf entry property predicate must contain const or enum"
+                    : "oneOf not branch property predicate must contain const or enum"
+    );
+    if (parsed_entry_result.IsErr()) {
+      return ResultErr(std::move(parsed_entry_result).UnwrapErr());
+    }
+    auto parsed_entry = std::move(parsed_entry_result).Unwrap();
+    if (!parsed_entry.has_required && !parsed_entry.property_predicate.has_value()) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          from_any_of
+              ? "oneOf not anyOf entry only supports required groups or single required property const/enum predicates"
+              : "oneOf not branch only supports required groups or single required property const/enum predicates"
+      );
+    }
+    return ResultOk(ParsedObjectNotEntry{std::move(parsed_entry), from_any_of});
+  };
+  auto apply_oneof_not_entry =
+      [&](ParsedObjectNotEntry parsed_not_entry,
+          const PresencePredicate& current_predicate,
+          NotPredicateConstraints* constraints) -> Result<bool, SchemaError> {
+    auto& parsed_entry = parsed_not_entry.entry;
+    if (parsed_entry.property_predicate.has_value()) {
+      const auto& property_name = parsed_entry.property_predicate->first;
+      if (parsed_entry.has_required &&
+          std::find(
+              parsed_entry.required_group.begin(),
+              parsed_entry.required_group.end(),
+              property_name
+          ) == parsed_entry.required_group.end()) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            parsed_not_entry.from_any_of
+                ? "oneOf not anyOf entry property predicate must also be listed in required"
+                : "oneOf not branch property predicate must also be listed in required"
+        );
+      }
+      bool property_known_required =
+          base_object.required.count(property_name) ||
+          std::find(
+              current_predicate.required_group.begin(),
+              current_predicate.required_group.end(),
+              property_name
+          ) != current_predicate.required_group.end() ||
+          std::find(
+              parsed_entry.required_group.begin(),
+              parsed_entry.required_group.end(),
+              property_name
+          ) != parsed_entry.required_group.end();
+      if (!property_known_required) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            parsed_not_entry.from_any_of
+                ? "oneOf not anyOf entry property predicate must also be listed in required or be base-required"
+                : "oneOf not branch property predicate must also be listed in required or be base-required"
+        );
+      }
+      PushBackUnique(
+          &constraints->forbidden_property_values,
+          std::make_pair(property_name, std::move(parsed_entry.property_predicate->second))
+      );
+      return ResultOk(true);
+    }
+    if (!parsed_entry.has_required) {
+      return ResultErr<SchemaError>(
+          SchemaErrorType::kInvalidSchema,
+          parsed_not_entry.from_any_of
+              ? "oneOf not anyOf entry only supports required groups or single required property const/enum predicates"
+              : "oneOf not branch only supports required groups or single required property const/enum predicates"
+      );
+    }
+    PushBackUnique(&constraints->forbidden_groups, std::move(parsed_entry.required_group));
+    return ResultOk(true);
+  };
+
+  auto parse_supported_not_groups = [&](const picojson::value& value,
+                                        const PresencePredicate& current_predicate
+                                   ) -> Result<NotPredicateConstraints, SchemaError> {
     if (!value.is<picojson::object>()) {
       return ResultErr<SchemaError>(
           SchemaErrorType::kInvalidSchema, "oneOf not branch must be an object"
       );
     }
     const auto& not_obj = value.get<picojson::object>();
-    std::vector<std::vector<std::string>> groups;
-    if (not_obj.count("required")) {
-      for (const auto& key : not_obj.ordered_keys()) {
-        if (key == "required" || key == "type" || is_ignorable_option_key(key)) {
-          continue;
-        }
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema,
-            "oneOf not branch only supports required or anyOf of required groups"
-        );
-      }
-      if (not_obj.count("type")) {
-        if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
-          return ResultErr<SchemaError>(
-              SchemaErrorType::kInvalidSchema, "oneOf not branch type must be object"
-          );
-        }
-      }
-      auto required_result = parse_required_group(not_obj.at("required"), "required");
-      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
-      groups.push_back(std::move(required_result).Unwrap());
-      return ResultOk(std::move(groups));
+    NotPredicateConstraints constraints;
+
+    if (not_obj.count("required") || not_obj.count("properties")) {
+      auto validate_result =
+          validate_oneof_not_container_keys(not_obj, /*allow_required=*/true, /*allow_anyof=*/false);
+      if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
+      auto parsed_entry_result = parse_oneof_not_entry(not_obj, /*from_any_of=*/false);
+      if (parsed_entry_result.IsErr()) return ResultErr(std::move(parsed_entry_result).UnwrapErr());
+      auto apply_result = apply_oneof_not_entry(
+          std::move(parsed_entry_result).Unwrap(), current_predicate, &constraints
+      );
+      if (apply_result.IsErr()) return ResultErr(std::move(apply_result).UnwrapErr());
+      return ResultOk(std::move(constraints));
     }
     if (!not_obj.count("anyOf") || !not_obj.at("anyOf").is<picojson::array>()) {
       return ResultErr<SchemaError>(
           SchemaErrorType::kInvalidSchema,
-          "oneOf not branch only supports required or anyOf of required groups"
+          "oneOf not branch only supports required groups, or required property const/enum predicates, or anyOf of those"
       );
     }
-    for (const auto& key : not_obj.ordered_keys()) {
-      if (key == "anyOf" || key == "type" || is_ignorable_option_key(key)) {
-        continue;
-      }
-      return ResultErr<SchemaError>(
-          SchemaErrorType::kInvalidSchema,
-          "oneOf not branch only supports required or anyOf of required groups"
-      );
-    }
-    if (not_obj.count("type")) {
-      if (!not_obj.at("type").is<std::string>() || not_obj.at("type").get<std::string>() != "object") {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "oneOf not branch type must be object"
-        );
-      }
-    }
+    auto validate_result =
+        validate_oneof_not_container_keys(not_obj, /*allow_required=*/false, /*allow_anyof=*/true);
+    if (validate_result.IsErr()) return ResultErr(std::move(validate_result).UnwrapErr());
     for (const auto& negated_option : not_obj.at("anyOf").get<picojson::array>()) {
       if (!negated_option.is<picojson::object>()) {
         return ResultErr<SchemaError>(
             SchemaErrorType::kInvalidSchema, "oneOf not anyOf entries must be objects"
         );
       }
-      const auto& negated_obj = negated_option.get<picojson::object>();
-      if (!negated_obj.count("required") || negated_obj.size() != 1) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema,
-            "oneOf not anyOf entries must contain only required"
-        );
-      }
-      auto required_result = parse_required_group(negated_obj.at("required"), "required");
-      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
-      groups.push_back(std::move(required_result).Unwrap());
+      auto parsed_entry_result =
+          parse_oneof_not_entry(negated_option.get<picojson::object>(), /*from_any_of=*/true);
+      if (parsed_entry_result.IsErr()) return ResultErr(std::move(parsed_entry_result).UnwrapErr());
+      auto apply_result = apply_oneof_not_entry(
+          std::move(parsed_entry_result).Unwrap(), current_predicate, &constraints
+      );
+      if (apply_result.IsErr()) return ResultErr(std::move(apply_result).UnwrapErr());
     }
-    return ResultOk(std::move(groups));
+    return ResultOk(std::move(constraints));
   };
 
+  std::function<Result<bool, SchemaError>(const picojson::value&, size_t, PresencePredicate*)>
+      parse_supported_presence_option =
+          [&](const picojson::value& value,
+              size_t option_index,
+              PresencePredicate* predicate) -> Result<bool, SchemaError> {
+        if (!value.is<picojson::object>()) {
+          return ResultOk(false);
+        }
+        const auto& option_obj = value.get<picojson::object>();
+        if (option_obj.count("type")) {
+          if (!option_obj.at("type").is<std::string>() ||
+              option_obj.at("type").get<std::string>() != "object") {
+            return ResultOk(false);
+          }
+        }
+
+        for (const auto& key : option_obj.ordered_keys()) {
+          if (key == "required" || key == "properties" || key == "dependentRequired" ||
+              key == "not" || key == "type" || key == "allOf" || is_ignorable_option_key(key)) {
+            continue;
+          }
+          return ResultOk(false);
+        }
+
+        bool has_supported_constraint = false;
+        if (option_obj.count("required")) {
+          auto required_result = parse_required_group(option_obj.at("required"), "required");
+          if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
+          auto required_group = std::move(required_result).Unwrap();
+          for (const auto& property_name : required_group) {
+            append_unique_name(&involved_properties, property_name);
+            if (std::find(predicate->required_group.begin(), predicate->required_group.end(), property_name) ==
+                predicate->required_group.end()) {
+              predicate->required_group.push_back(property_name);
+            }
+          }
+          has_supported_constraint = true;
+        }
+
+        if (option_obj.count("not")) {
+          auto forbidden_result = parse_supported_not_groups(option_obj.at("not"), *predicate);
+          if (forbidden_result.IsErr()) return ResultErr(std::move(forbidden_result).UnwrapErr());
+          auto forbidden_constraints = std::move(forbidden_result).Unwrap();
+          for (auto& group : forbidden_constraints.forbidden_groups) {
+            for (const auto& property_name : group) {
+              append_unique_name(&involved_properties, property_name);
+            }
+            if (std::find(
+                    predicate->forbidden_groups.begin(),
+                    predicate->forbidden_groups.end(),
+                    group
+                ) == predicate->forbidden_groups.end()) {
+              PushBackUnique(&predicate->forbidden_groups, std::move(group));
+            }
+          }
+          for (auto& exclusion : forbidden_constraints.forbidden_property_values) {
+            append_unique_name(&involved_properties, exclusion.first);
+            PushBackUnique(&predicate->forbidden_property_values, std::move(exclusion));
+          }
+          has_supported_constraint = true;
+        }
+
+        if (option_obj.count("properties")) {
+          if (!option_obj.at("properties").is<picojson::object>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, "properties must be an object"
+            );
+          }
+          const auto& properties_obj = option_obj.at("properties").get<picojson::object>();
+          for (const auto& property_name : properties_obj.ordered_keys()) {
+            if (std::find(predicate->required_group.begin(), predicate->required_group.end(), property_name) ==
+                    predicate->required_group.end() &&
+                !base_object.required.count(property_name)) {
+              return ResultOk(false);
+            }
+            append_unique_name(&involved_properties, property_name);
+            auto property_result = WithSchemaPath(
+                {"oneOf", std::to_string(option_index), "properties", property_name},
+                [&]() { return Parse(properties_obj.at(property_name), property_name); }
+            );
+            if (property_result.IsErr()) return ResultErr(std::move(property_result).UnwrapErr());
+            predicate->property_refinements.push_back(
+                {property_name, std::move(property_result).Unwrap()}
+            );
+          }
+          has_supported_constraint = true;
+        }
+
+        if (option_obj.count("dependentRequired")) {
+          if (!option_obj.at("dependentRequired").is<picojson::object>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, "dependentRequired must be an object"
+            );
+          }
+          const auto& dependencies_obj = option_obj.at("dependentRequired").get<picojson::object>();
+          for (const auto& property_name : dependencies_obj.ordered_keys()) {
+            auto required_result = parse_required_group(
+                dependencies_obj.at(property_name), "dependentRequired values"
+            );
+            if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
+            auto required_group = std::move(required_result).Unwrap();
+            append_unique_name(&involved_properties, property_name);
+            for (const auto& target_name : required_group) {
+              append_unique_name(&involved_properties, target_name);
+            }
+            auto dependency = std::make_pair(property_name, std::move(required_group));
+            if (std::find(
+                    predicate->dependent_required.begin(),
+                    predicate->dependent_required.end(),
+                    dependency
+                ) == predicate->dependent_required.end()) {
+              predicate->dependent_required.push_back(std::move(dependency));
+            }
+          }
+          has_supported_constraint = true;
+        }
+
+        if (option_obj.count("allOf")) {
+          if (!option_obj.at("allOf").is<picojson::array>()) {
+            return ResultErr<SchemaError>(
+                SchemaErrorType::kInvalidSchema, "allOf must be an array"
+            );
+          }
+          bool has_supported_child = false;
+          for (const auto& child : option_obj.at("allOf").get<picojson::array>()) {
+            auto child_result = parse_supported_presence_option(child, option_index, predicate);
+            if (child_result.IsErr()) return ResultErr(std::move(child_result).UnwrapErr());
+            if (!std::move(child_result).Unwrap()) {
+              return ResultOk(false);
+            }
+            has_supported_child = true;
+          }
+          has_supported_constraint = has_supported_constraint || has_supported_child;
+        }
+
+        return ResultOk(has_supported_constraint);
+      };
+
   for (const auto& option : schema.at("oneOf").get<picojson::array>()) {
-    if (!option.is<picojson::object>()) {
-      return ResultOk(std::nullopt);
-    }
-    const auto& option_obj = option.get<picojson::object>();
-    if (option_obj.count("type")) {
-      if (!option_obj.at("type").is<std::string>() ||
-          option_obj.at("type").get<std::string>() != "object") {
-        return ResultOk(std::nullopt);
-      }
-    }
-
-    for (const auto& key : option_obj.ordered_keys()) {
-      if (key == "required" || key == "properties" || key == "not" || key == "type" ||
-          is_ignorable_option_key(key)) {
-        continue;
-      }
-      return ResultOk(std::nullopt);
-    }
-
     PresencePredicate predicate;
-    bool has_supported_constraint = false;
-    if (option_obj.count("required")) {
-      auto required_result = parse_required_group(option_obj.at("required"), "required");
-      if (required_result.IsErr()) return ResultErr(std::move(required_result).UnwrapErr());
-      predicate.required_group = std::move(required_result).Unwrap();
-      for (const auto& property_name : predicate.required_group) {
-        append_unique_name(&involved_properties, property_name);
-      }
-      has_supported_constraint = true;
-    }
-
-    if (option_obj.count("not")) {
-      auto forbidden_result = parse_supported_not_groups(option_obj.at("not"));
-      if (forbidden_result.IsErr()) return ResultErr(std::move(forbidden_result).UnwrapErr());
-      predicate.forbidden_groups = std::move(forbidden_result).Unwrap();
-      for (const auto& group : predicate.forbidden_groups) {
-        for (const auto& property_name : group) {
-          append_unique_name(&involved_properties, property_name);
-        }
-      }
-      has_supported_constraint = true;
-    }
-
-    if (!has_supported_constraint) {
+    auto supported_result =
+        parse_supported_presence_option(option, predicates.size(), &predicate);
+    if (supported_result.IsErr()) return ResultErr(std::move(supported_result).UnwrapErr());
+    if (!std::move(supported_result).Unwrap()) {
       return ResultOk(std::nullopt);
     }
-
-    if (option_obj.count("properties")) {
-      if (!option_obj.at("properties").is<picojson::object>()) {
-        return ResultErr<SchemaError>(
-            SchemaErrorType::kInvalidSchema, "properties must be an object"
-        );
-      }
-      const auto& properties_obj = option_obj.at("properties").get<picojson::object>();
-      for (const auto& property_name : properties_obj.ordered_keys()) {
-        if (std::find(predicate.required_group.begin(), predicate.required_group.end(), property_name) ==
-                predicate.required_group.end() &&
-            !base_object.required.count(property_name)) {
-          return ResultOk(std::nullopt);
-        }
-        append_unique_name(&involved_properties, property_name);
-        auto property_result = Parse(properties_obj.at(property_name), property_name);
-        if (property_result.IsErr()) return ResultErr(std::move(property_result).UnwrapErr());
-        predicate.property_refinements.push_back({property_name, std::move(property_result).Unwrap()});
-      }
-    }
-
     predicates.push_back(std::move(predicate));
   }
 
@@ -4322,7 +5506,6 @@ Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiv
       return present.count(property_name);
     });
   };
-
   AnyOfSpec exact_anyof;
   uint64_t assignment_count = uint64_t{1} << involved_properties.size();
   for (uint64_t mask = 0; mask < assignment_count; ++mask) {
@@ -4346,8 +5529,7 @@ Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiv
       continue;
     }
 
-    int matched_predicates = 0;
-    int matched_predicate_index = -1;
+    std::vector<SchemaSpecPtr> matched_branches;
     for (size_t predicate_idx = 0; predicate_idx < predicates.size(); ++predicate_idx) {
       const auto& predicate = predicates[predicate_idx];
       bool matched = predicate.required_group.empty() ||
@@ -4361,78 +5543,137 @@ Result<std::optional<SchemaSpecPtr>, SchemaError> SchemaParser::TryParseExclusiv
             });
       }
       if (matched) {
-        matched_predicate_index = static_cast<int>(predicate_idx);
-        ++matched_predicates;
-        if (matched_predicates > 1) {
-          break;
+        matched = std::all_of(
+            predicate.dependent_required.begin(),
+            predicate.dependent_required.end(),
+            [&](const std::pair<std::string, std::vector<std::string>>& dependency) {
+              return !present_properties.count(dependency.first) ||
+                     is_group_satisfied(dependency.second, present_properties);
+            });
+      }
+      if (!matched) {
+        continue;
+      }
+
+      ObjectSpec branch_spec = base_object;
+      branch_spec.properties.clear();
+      for (const auto& property : base_object.properties) {
+        bool is_involved =
+            std::find(involved_properties.begin(), involved_properties.end(), property.name) !=
+            involved_properties.end();
+        if (!is_involved || present_properties.count(property.name)) {
+          branch_spec.properties.push_back(property);
         }
       }
-    }
-    if (matched_predicates != 1) {
-      continue;
-    }
+      for (const auto& property_name : involved_properties) {
+        if (present_properties.count(property_name)) {
+          branch_spec.required.insert(property_name);
+        } else {
+          branch_spec.required.erase(property_name);
+        }
+      }
 
-    ObjectSpec branch_spec = base_object;
-    branch_spec.properties.clear();
-    for (const auto& property : base_object.properties) {
-      bool is_involved =
-          std::find(involved_properties.begin(), involved_properties.end(), property.name) !=
-          involved_properties.end();
-      if (!is_involved || present_properties.count(property.name)) {
-        branch_spec.properties.push_back(property);
-      }
-    }
-    for (const auto& property_name : involved_properties) {
-      if (present_properties.count(property_name)) {
-        branch_spec.required.insert(property_name);
-      } else {
-        branch_spec.required.erase(property_name);
-      }
-    }
-
-    bool branch_is_unsatisfiable = false;
-    const auto& matched_predicate = predicates[matched_predicate_index];
-    for (const auto& refinement : matched_predicate.property_refinements) {
-      auto property_it = std::find_if(
-          branch_spec.properties.begin(),
-          branch_spec.properties.end(),
-          [&](const ObjectSpec::Property& property) { return property.name == refinement.name; }
-      );
-      if (property_it == branch_spec.properties.end()) {
-        branch_is_unsatisfiable = true;
-        break;
-      }
-      auto merge_result = MergeSchemaSpecs(
-          property_it->schema, refinement.schema, rule_name_hint + "_" + refinement.name
-      );
-      if (merge_result.IsErr()) {
-        auto err = std::move(merge_result).UnwrapErr();
-        if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+      bool branch_is_unsatisfiable = false;
+      for (const auto& refinement : predicate.property_refinements) {
+        auto property_it = std::find_if(
+            branch_spec.properties.begin(),
+            branch_spec.properties.end(),
+            [&](const ObjectSpec::Property& property) { return property.name == refinement.name; }
+        );
+        if (property_it == branch_spec.properties.end()) {
           branch_is_unsatisfiable = true;
           break;
         }
-        return ResultErr<SchemaError>(std::move(err));
+        auto merge_result = MergeSchemaSpecs(
+            property_it->schema, refinement.schema, rule_name_hint + "_" + refinement.name
+        );
+        if (merge_result.IsErr()) {
+          auto err = std::move(merge_result).UnwrapErr();
+          if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+            branch_is_unsatisfiable = true;
+            break;
+          }
+          return ResultErr<SchemaError>(std::move(err));
+        }
+        property_it->schema = std::move(merge_result).Unwrap();
       }
-      property_it->schema = std::move(merge_result).Unwrap();
+      for (const auto& exclusion : predicate.forbidden_property_values) {
+        auto property_it = std::find_if(
+            branch_spec.properties.begin(),
+            branch_spec.properties.end(),
+            [&](const ObjectSpec::Property& property) { return property.name == exclusion.first; }
+        );
+        if (property_it == branch_spec.properties.end()) {
+          continue;
+        }
+        auto applied_result = ApplyForbiddenValuesToPropertySchema(
+            property_it->schema, exclusion.second, exclusion.first, rule_name_hint
+        );
+        if (applied_result.IsErr()) {
+          return ResultErr(std::move(applied_result).UnwrapErr());
+        }
+        auto applied = std::move(applied_result).Unwrap();
+        if (applied.status == ForbiddenValueApplicationResult::Status::kUnsupportedNonFinite) {
+          return ResultOk(std::nullopt);
+        }
+        if (applied.status == ForbiddenValueApplicationResult::Status::kUnsatisfiable) {
+          branch_is_unsatisfiable = true;
+          break;
+        }
+        property_it->schema = std::move(applied.schema);
+      }
+      if (branch_is_unsatisfiable) {
+        continue;
+      }
+
+      if (branch_spec.max_properties != -1 &&
+          static_cast<int>(branch_spec.required.size()) > branch_spec.max_properties) {
+        continue;
+      }
+      if (branch_spec.max_properties != -1 &&
+          branch_spec.min_properties > branch_spec.max_properties) {
+        continue;
+      }
+      if (branch_spec.min_properties > static_cast<int>(branch_spec.properties.size())) {
+        continue;
+      }
+
+      matched_branches.push_back(
+          SchemaSpec::Make(std::move(branch_spec), "", rule_name_hint + "_presence")
+      );
     }
-    if (branch_is_unsatisfiable) {
+    if (matched_branches.empty()) {
       continue;
     }
 
-    if (branch_spec.max_properties != -1 &&
-        static_cast<int>(branch_spec.required.size()) > branch_spec.max_properties) {
-      continue;
+    bool has_only_identical_overlap = false;
+    for (size_t i = 0; i < matched_branches.size(); ++i) {
+      for (size_t j = i + 1; j < matched_branches.size(); ++j) {
+        auto overlap_result = MergeSchemaSpecs(
+            matched_branches[i],
+            matched_branches[j],
+            rule_name_hint + "_overlap_" + std::to_string(i) + "_" + std::to_string(j)
+        );
+        if (overlap_result.IsOk()) {
+          if (matched_branches[i]->ToString() == matched_branches[j]->ToString()) {
+            has_only_identical_overlap = true;
+            continue;
+          }
+          return ResultOk(std::nullopt);
+        }
+        auto err = std::move(overlap_result).UnwrapErr();
+        if (err.Type() != SchemaErrorType::kUnsatisfiableSchema) {
+          return ResultErr<SchemaError>(std::move(err));
+        }
+      }
     }
-    if (branch_spec.max_properties != -1 && branch_spec.min_properties > branch_spec.max_properties) {
-      continue;
-    }
-    if (branch_spec.min_properties > static_cast<int>(branch_spec.properties.size())) {
+    if (has_only_identical_overlap) {
       continue;
     }
 
-    exact_anyof.options.push_back(
-        SchemaSpec::Make(std::move(branch_spec), "", rule_name_hint + "_presence")
-    );
+    for (auto& branch : matched_branches) {
+      exact_anyof.options.push_back(std::move(branch));
+    }
   }
 
   if (exact_anyof.options.empty()) {
@@ -4495,7 +5736,9 @@ Result<AllOfSpec, SchemaError> SchemaParser::ParseAllOf(const picojson::object& 
   }
   int idx = 0;
   for (const auto& sub_schema : schema.at("allOf").get<picojson::array>()) {
-    Result<SchemaSpecPtr, SchemaError> sub_result = [&]() -> Result<SchemaSpecPtr, SchemaError> {
+    Result<SchemaSpecPtr, SchemaError> sub_result = WithSchemaPath(
+        {"allOf", std::to_string(idx)},
+        [&]() -> Result<SchemaSpecPtr, SchemaError> {
       if (!base_schema.empty() && sub_schema.is<picojson::object>()) {
         const auto& sub_schema_obj = sub_schema.get<picojson::object>();
         if (sub_schema_obj.count("oneOf") || sub_schema_obj.count("if") ||
@@ -4535,7 +5778,7 @@ Result<AllOfSpec, SchemaError> SchemaParser::ParseAllOf(const picojson::object& 
         }
       }
       return Parse(sub_schema, "all_" + std::to_string(idx));
-    }();
+    });
     if (sub_result.IsErr()) return ResultErr(std::move(sub_result).UnwrapErr());
     auto parsed = std::move(sub_result).Unwrap();
     merge_candidates.push_back(std::move(parsed));
@@ -4556,11 +5799,12 @@ Result<TypeArraySpec, SchemaError> SchemaParser::ParseTypeArray(
   picojson::object schema_copy = schema;
   if (type_array.empty()) {
     schema_copy.erase("type");
-    auto any_result = Parse(picojson::value(schema_copy), rule_name_hint);
+    auto any_result = WithSchemaPath({"type"}, [&]() { return Parse(picojson::value(schema_copy), rule_name_hint); });
     if (any_result.IsErr()) return ResultErr(std::move(any_result).UnwrapErr());
     spec.type_schemas.push_back(std::move(any_result).Unwrap());
     return ResultOk(std::move(spec));
   }
+  int idx = 0;
   for (const auto& type : type_array) {
     if (!type.is<std::string>()) {
       return ResultErr<SchemaError>(
@@ -4568,10 +5812,12 @@ Result<TypeArraySpec, SchemaError> SchemaParser::ParseTypeArray(
       );
     }
     schema_copy["type"] = type;
-    auto type_result =
-        Parse(picojson::value(schema_copy), rule_name_hint + "_" + type.get<std::string>());
+    auto type_result = WithSchemaPath({"type", std::to_string(idx)}, [&]() {
+      return Parse(picojson::value(schema_copy), rule_name_hint + "_" + type.get<std::string>());
+    });
     if (type_result.IsErr()) return ResultErr(std::move(type_result).UnwrapErr());
     spec.type_schemas.push_back(std::move(type_result).Unwrap());
+    ++idx;
   }
   return ResultOk(std::move(spec));
 }
@@ -4584,7 +5830,8 @@ Result<bool, SchemaError> SchemaParser::AreSchemasDisjoint(
     auto merged = std::move(merge_result).Unwrap();
     if (std::holds_alternative<ObjectSpec>(merged->spec)) {
       const auto& object = std::get<ObjectSpec>(merged->spec);
-      if (!object.dependent_required.empty() || !object.forbidden_groups.empty()) {
+      if (!object.dependent_required.empty() || !object.forbidden_groups.empty() ||
+          !object.forbidden_property_values.empty()) {
         auto normalized_result =
             NormalizeObjectPresenceConstraints(object, rule_name_hint + "_presence");
         if (normalized_result.IsOk()) {
@@ -4610,7 +5857,8 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeObjectPresenceConstrai
     const ObjectSpec& object, const std::string& rule_name_hint
 ) {
   constexpr size_t kMaxExactPresenceProperties = 10;
-  if (object.dependent_required.empty() && object.forbidden_groups.empty()) {
+  if (object.dependent_required.empty() && object.forbidden_groups.empty() &&
+      object.forbidden_property_values.empty()) {
     return ResultOk(SchemaSpec::Make(object, "", rule_name_hint));
   }
   if (!object.pattern_properties.empty() || object.property_names ||
@@ -4656,11 +5904,17 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeObjectPresenceConstrai
       }
     }
   }
+  for (const auto& exclusion : object.forbidden_property_values) {
+    if (explicit_properties.count(exclusion.first)) {
+      append_unique_name(&involved_properties, exclusion.first);
+    }
+  }
 
   if (involved_properties.empty()) {
     ObjectSpec normalized = object;
     normalized.dependent_required.clear();
     normalized.forbidden_groups.clear();
+    normalized.forbidden_property_values.clear();
     return ResultOk(SchemaSpec::Make(std::move(normalized), "", rule_name_hint));
   }
   if (involved_properties.size() > kMaxExactPresenceProperties) {
@@ -4735,6 +5989,7 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeObjectPresenceConstrai
     ObjectSpec branch_spec = object;
     branch_spec.dependent_required.clear();
     branch_spec.forbidden_groups.clear();
+    branch_spec.forbidden_property_values.clear();
     branch_spec.properties.clear();
     for (const auto& property : object.properties) {
       bool is_involved =
@@ -4750,6 +6005,42 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeObjectPresenceConstrai
       } else {
         branch_spec.required.erase(property_name);
       }
+    }
+
+    bool branch_is_unsatisfiable = false;
+    for (const auto& exclusion : object.forbidden_property_values) {
+      if (!present_properties.count(exclusion.first)) {
+        continue;
+      }
+      auto property_it = std::find_if(
+          branch_spec.properties.begin(),
+          branch_spec.properties.end(),
+          [&](const ObjectSpec::Property& property) { return property.name == exclusion.first; }
+      );
+      if (property_it == branch_spec.properties.end()) {
+        continue;
+      }
+      auto applied_result = ApplyForbiddenValuesToPropertySchema(
+          property_it->schema, exclusion.second, exclusion.first, rule_name_hint
+      );
+      if (applied_result.IsErr()) {
+        return ResultErr(std::move(applied_result).UnwrapErr());
+      }
+      auto applied = std::move(applied_result).Unwrap();
+      if (applied.status == ForbiddenValueApplicationResult::Status::kUnsupportedNonFinite) {
+        return ResultErr<SchemaError>(
+            SchemaErrorType::kInvalidSchema,
+            "object finite exclusion requires const or enum property domains: " + exclusion.first
+        );
+      }
+      if (applied.status == ForbiddenValueApplicationResult::Status::kUnsatisfiable) {
+        branch_is_unsatisfiable = true;
+        break;
+      }
+      property_it->schema = std::move(applied.schema);
+    }
+    if (branch_is_unsatisfiable) {
+      continue;
     }
 
     if (branch_spec.max_properties != -1 &&
@@ -4916,10 +6207,210 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeExclusiveDisjunctionsI
       if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
       array.additional_items = std::move(normalized_result).Unwrap();
     }
-    if (array.contains_item) {
-      auto normalized_result = normalize_child(array.contains_item, rule_name_hint + "_contains");
+    for (size_t i = 0; i < array.contains_items.size(); ++i) {
+      auto normalized_result = normalize_child(
+          array.contains_items[i], rule_name_hint + "_contains_" + std::to_string(i)
+      );
       if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
-      array.contains_item = std::move(normalized_result).Unwrap();
+      array.contains_items[i] = std::move(normalized_result).Unwrap();
+    }
+    std::unordered_map<const SchemaSpec*, std::string> schema_key_cache;
+    auto get_schema_key = [&](const SchemaSpecPtr& schema) -> const std::string& {
+      auto [it, inserted] = schema_key_cache.try_emplace(schema.get());
+      if (inserted) {
+        it->second = StructuralSchemaKey(schema);
+      }
+      return it->second;
+    };
+    if (!array.contains_items.empty()) {
+      std::vector<SchemaSpecPtr> deduped_contains_items;
+      std::unordered_set<std::string> seen_contains_keys;
+      deduped_contains_items.reserve(array.contains_items.size());
+      for (const auto& contains_item : array.contains_items) {
+        if (!seen_contains_keys.insert(get_schema_key(contains_item)).second) {
+          continue;
+        }
+        deduped_contains_items.push_back(contains_item);
+      }
+      array.contains_items = std::move(deduped_contains_items);
+    }
+    if (!array.contains_items.empty() && array.additional_items) {
+      std::string additional_key = get_schema_key(array.additional_items);
+      std::vector<SchemaSpecPtr> nontrivial_contains_items;
+      nontrivial_contains_items.reserve(array.contains_items.size());
+      bool dropped_trivial_contains = false;
+      for (const auto& contains_item : array.contains_items) {
+        if (get_schema_key(contains_item) == additional_key) {
+          dropped_trivial_contains = true;
+          continue;
+        }
+        nontrivial_contains_items.push_back(contains_item);
+      }
+      if (dropped_trivial_contains) {
+        array.min_items = std::max<int64_t>(array.min_items, 1);
+        array.contains_items = std::move(nontrivial_contains_items);
+      }
+    }
+    if (!array.contains_items.empty()) {
+      bool changed = true;
+      while (changed) {
+        changed = false;
+        std::vector<bool> keep(array.contains_items.size(), true);
+        std::unordered_map<uint64_t, SchemaSpecPtr> pair_merge_cache;
+        std::unordered_set<uint64_t> unsatisfiable_pair_masks;
+        auto merge_pair = [&](size_t i, size_t j) -> Result<std::optional<SchemaSpecPtr>, SchemaError> {
+          uint64_t pair_mask = (uint64_t{1} << i) | (uint64_t{1} << j);
+          auto cache_it = pair_merge_cache.find(pair_mask);
+          if (cache_it != pair_merge_cache.end()) {
+            return ResultOk<std::optional<SchemaSpecPtr>>(cache_it->second);
+          }
+          if (unsatisfiable_pair_masks.count(pair_mask) != 0) {
+            return ResultOk<std::optional<SchemaSpecPtr>>(std::nullopt);
+          }
+          auto merged_contains = MergeAllOfSchemas(
+              {array.contains_items[i], array.contains_items[j]},
+              rule_name_hint + "_contains_pair_" + std::to_string(i) + "_" + std::to_string(j)
+          );
+          if (merged_contains.IsErr()) {
+            auto err = std::move(merged_contains).UnwrapErr();
+            if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+              unsatisfiable_pair_masks.insert(pair_mask);
+              return ResultOk<std::optional<SchemaSpecPtr>>(std::nullopt);
+            }
+            return ResultErr<SchemaError>(std::move(err));
+          }
+          auto merged_contains_spec = std::move(merged_contains).Unwrap();
+          pair_merge_cache.emplace(pair_mask, merged_contains_spec);
+          return ResultOk<std::optional<SchemaSpecPtr>>(std::move(merged_contains_spec));
+        };
+        for (size_t i = 0; i < array.contains_items.size(); ++i) {
+          if (!keep[i]) {
+            continue;
+          }
+          for (size_t j = i + 1; j < array.contains_items.size(); ++j) {
+            if (!keep[j]) {
+              continue;
+            }
+            auto merged_contains_result = merge_pair(i, j);
+            if (merged_contains_result.IsErr()) {
+              return finish_err(std::move(merged_contains_result).UnwrapErr());
+            }
+            auto merged_contains_spec = std::move(merged_contains_result).Unwrap();
+            if (!merged_contains_spec.has_value()) {
+              continue;
+            }
+            std::string merged_key = get_schema_key(*merged_contains_spec);
+            std::string lhs_key = get_schema_key(array.contains_items[i]);
+            std::string rhs_key = get_schema_key(array.contains_items[j]);
+            if (merged_key == lhs_key && merged_key != rhs_key) {
+              keep[j] = false;
+              changed = true;
+            } else if (merged_key == rhs_key && merged_key != lhs_key) {
+              keep[i] = false;
+              changed = true;
+              break;
+            }
+          }
+        }
+        if (changed) {
+          std::vector<SchemaSpecPtr> pruned_contains_items;
+          pruned_contains_items.reserve(array.contains_items.size());
+          for (size_t i = 0; i < array.contains_items.size(); ++i) {
+            if (keep[i]) {
+              pruned_contains_items.push_back(array.contains_items[i]);
+            }
+          }
+          array.contains_items = std::move(pruned_contains_items);
+        }
+      }
+    }
+    if (array.contains_items.empty()) {
+      array.min_contains = 0;
+    }
+    if (array.max_items != -1 && array.min_items > array.max_items) {
+      return finish_err(SchemaError(
+          SchemaErrorType::kUnsatisfiableSchema, "contains conflicts with array item count constraints"
+      ));
+    }
+    array.contains_subsets.clear();
+    if (!array.contains_items.empty()) {
+      constexpr size_t kMaxIndependentContainsPredicates = 8;
+      if (array.contains_items.size() > kMaxIndependentContainsPredicates) {
+        return finish_err(SchemaError(
+            SchemaErrorType::kInvalidSchema,
+            "contains involves too many independent predicates to normalize exactly: " +
+                rule_name_hint
+        ));
+      }
+      uint64_t full_mask = (uint64_t{1} << array.contains_items.size()) - 1;
+      std::unordered_map<std::string, size_t> subset_key_to_index;
+      std::vector<SchemaSpecPtr> subset_spec_cache(full_mask + 1);
+      std::vector<bool> subset_spec_ready(full_mask + 1, false);
+      std::vector<bool> subset_spec_unsatisfiable(full_mask + 1, false);
+      auto merge_subset = [&](auto&& self, uint64_t subset)
+          -> Result<std::optional<SchemaSpecPtr>, SchemaError> {
+        XGRAMMAR_DCHECK(subset != 0);
+        if (subset_spec_ready[subset]) {
+          if (subset_spec_unsatisfiable[subset]) {
+            return ResultOk<std::optional<SchemaSpecPtr>>(std::nullopt);
+          }
+          return ResultOk<std::optional<SchemaSpecPtr>>(subset_spec_cache[subset]);
+        }
+        subset_spec_ready[subset] = true;
+        if ((subset & (subset - 1)) == 0) {
+          size_t idx = static_cast<size_t>(__builtin_ctzll(subset));
+          subset_spec_cache[subset] = array.contains_items[idx];
+          return ResultOk<std::optional<SchemaSpecPtr>>(subset_spec_cache[subset]);
+        }
+
+        uint64_t lsb = subset & (~subset + 1);
+        uint64_t prev_subset = subset ^ lsb;
+        auto prev_result = self(self, prev_subset);
+        if (prev_result.IsErr()) {
+          return ResultErr<SchemaError>(std::move(prev_result).UnwrapErr());
+        }
+        auto prev_spec = std::move(prev_result).Unwrap();
+        if (!prev_spec.has_value()) {
+          subset_spec_unsatisfiable[subset] = true;
+          return ResultOk<std::optional<SchemaSpecPtr>>(std::nullopt);
+        }
+        size_t idx = static_cast<size_t>(__builtin_ctzll(lsb));
+        auto merged_subset = MergeSchemaSpecs(
+            *prev_spec,
+            array.contains_items[idx],
+            rule_name_hint + "_contains_subset_" + std::to_string(subset)
+        );
+        if (merged_subset.IsErr()) {
+          auto err = std::move(merged_subset).UnwrapErr();
+          if (err.Type() == SchemaErrorType::kUnsatisfiableSchema) {
+            subset_spec_unsatisfiable[subset] = true;
+            return ResultOk<std::optional<SchemaSpecPtr>>(std::nullopt);
+          }
+          return ResultErr<SchemaError>(std::move(err));
+        }
+        subset_spec_cache[subset] = std::move(merged_subset).Unwrap();
+        return ResultOk<std::optional<SchemaSpecPtr>>(subset_spec_cache[subset]);
+      };
+      for (uint64_t subset = 1; subset <= full_mask; ++subset) {
+        auto merged_subset_result = merge_subset(merge_subset, subset);
+        if (merged_subset_result.IsErr()) {
+          return finish_err(std::move(merged_subset_result).UnwrapErr());
+        }
+        auto merged_subset_spec = std::move(merged_subset_result).Unwrap();
+        if (!merged_subset_spec.has_value()) {
+          continue;
+        }
+        std::string subset_key = get_schema_key(*merged_subset_spec);
+        auto existing_it = subset_key_to_index.find(subset_key);
+        if (existing_it != subset_key_to_index.end()) {
+          array.contains_subsets[existing_it->second].mask |= subset;
+          continue;
+        }
+        subset_key_to_index.emplace(subset_key, array.contains_subsets.size());
+        array.contains_subsets.push_back(
+            ArraySpec::ContainsSubset{subset, std::move(*merged_subset_spec)}
+        );
+      }
     }
     return finish_ok();
   }
@@ -4959,7 +6450,8 @@ Result<SchemaSpecPtr, SchemaError> SchemaParser::NormalizeExclusiveDisjunctionsI
       if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
       object.property_names = std::move(normalized_result).Unwrap();
     }
-    if (!object.dependent_required.empty() || !object.forbidden_groups.empty()) {
+    if (!object.dependent_required.empty() || !object.forbidden_groups.empty() ||
+        !object.forbidden_property_values.empty()) {
       auto normalized_result =
           NormalizeObjectPresenceConstraints(object, rule_name_hint + "_presence");
       if (normalized_result.IsErr()) return finish_err(std::move(normalized_result).UnwrapErr());
@@ -5504,47 +6996,105 @@ std::string JSONSchemaConverter::GenerateArray(
   if (spec.min_contains > 0) {
     XGRAMMAR_CHECK(spec.prefix_items.empty() && spec.allow_additional_items && !additional_rule_name.empty())
         << "contains is only supported for homogeneous arrays with additional items";
-    std::string contains_rule_name = CreateRule(spec.contains_item, rule_name + "_contains");
+    XGRAMMAR_CHECK(!spec.contains_items.empty()) << "contains requires at least one contains schema";
     int64_t sequence_min_items = std::max<int64_t>(1, spec.min_items);
     int64_t sequence_max_items = spec.max_items;
-
-    auto repeat_tail = [&](int64_t min_repeats, int64_t max_repeats) {
-      std::string tail_pattern = EBNFScriptCreator::Concat({mid_separator, additional_rule_name});
-      return EBNFScriptCreator::Repeat(
-          tail_pattern,
-          static_cast<int>(min_repeats),
-          max_repeats == -1 ? -1 : static_cast<int>(max_repeats)
-      );
+    uint64_t full_mask = (uint64_t{1} << spec.contains_items.size()) - 1;
+    std::vector<std::pair<uint64_t, std::string>> subset_rules;
+    auto append_subset_rule = [&](uint64_t subset_mask, const std::string& subset_rule_name) {
+      for (auto& [existing_mask, existing_rule_name] : subset_rules) {
+        if (existing_rule_name == subset_rule_name) {
+          existing_mask |= subset_mask;
+          return;
+        }
+      }
+      subset_rules.emplace_back(subset_mask, subset_rule_name);
     };
+    append_subset_rule(0, additional_rule_name);
+    for (const auto& contains_subset : spec.contains_subsets) {
+      std::string subset_rule_body = GenerateFromSpec(
+          contains_subset.schema,
+          rule_name + "_contains_subset_" + std::to_string(contains_subset.mask)
+      );
+      append_subset_rule(
+          contains_subset.mask,
+          CreateGeneratedRule(
+              rule_name + "_contains_subset_" + std::to_string(contains_subset.mask),
+              subset_rule_body
+          )
+      );
+    }
 
-    std::unordered_map<std::string, std::string> contains_sequence_cache;
-    std::function<std::string(int64_t, int64_t)> build_contains_sequence =
-        [&](int64_t min_items, int64_t max_items) -> std::string {
-      std::string cache_key =
-          std::to_string(min_items) + ":" + (max_items == -1 ? "*" : std::to_string(max_items));
-      auto it = contains_sequence_cache.find(cache_key);
+    XGRAMMAR_CHECK(!subset_rules.empty())
+        << "contains array lowering must retain at least the additional item branch";
+
+    struct ContainsSequenceState {
+      uint64_t satisfied_mask;
+      int64_t min_items;
+      int64_t max_items;
+
+      bool operator==(const ContainsSequenceState& other) const {
+        return satisfied_mask == other.satisfied_mask && min_items == other.min_items &&
+               max_items == other.max_items;
+      }
+    };
+    struct ContainsSequenceStateHash {
+      size_t operator()(const ContainsSequenceState& state) const {
+        size_t seed = std::hash<uint64_t>{}(state.satisfied_mask);
+        seed ^= std::hash<int64_t>{}(state.min_items) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<int64_t>{}(state.max_items) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        return seed;
+      }
+    };
+    std::unordered_map<ContainsSequenceState, std::string, ContainsSequenceStateHash>
+        contains_sequence_cache;
+    std::function<std::string(uint64_t, int64_t, int64_t)> build_contains_sequence =
+        [&](uint64_t satisfied_mask, int64_t min_items, int64_t max_items) -> std::string {
+      ContainsSequenceState state{satisfied_mask, min_items, max_items};
+      auto it = contains_sequence_cache.find(state);
       if (it != contains_sequence_cache.end()) {
         return it->second;
       }
 
       std::string sequence_rule_name =
           ebnf_script_creator_.AllocateRuleName(rule_name + "_contains_seq");
-      contains_sequence_cache.emplace(cache_key, sequence_rule_name);
+      contains_sequence_cache.emplace(state, sequence_rule_name);
 
       std::vector<std::string> options;
-      int64_t min_tail_items = std::max<int64_t>(0, min_items - 1);
-      int64_t max_tail_items = max_items == -1 ? -1 : max_items - 1;
-      if (max_tail_items == -1 || min_tail_items <= max_tail_items) {
-        options.push_back(contains_rule_name + " " + repeat_tail(min_tail_items, max_tail_items));
+      std::unordered_set<std::string> seen_options;
+      auto append_option = [&](std::string option) {
+        if (!seen_options.insert(option).second) {
+          return;
+        }
+        options.push_back(std::move(option));
+      };
+      if (satisfied_mask == full_mask && min_items == 0) {
+        append_option("\"\"");
       }
 
-      if (max_items == -1 || max_items > 1) {
-        int64_t next_min_items = std::max<int64_t>(1, min_items - 1);
+      if (max_items != 0) {
+        int64_t next_min_items = std::max<int64_t>(0, min_items - 1);
         int64_t next_max_items = max_items == -1 ? -1 : max_items - 1;
-        if (next_max_items == -1 || next_min_items <= next_max_items) {
-          std::string next_sequence =
-              build_contains_sequence(next_min_items, next_max_items);
-          options.push_back(additional_rule_name + " " + mid_separator + " " + next_sequence);
+        for (const auto& [subset_mask, subset_rule_name] : subset_rules) {
+          uint64_t next_mask = satisfied_mask | subset_mask;
+          if (next_max_items != -1 && next_min_items > next_max_items) {
+            continue;
+          }
+          bool next_can_be_empty = next_mask == full_mask && next_min_items == 0;
+          if (next_can_be_empty) {
+            append_option(subset_rule_name);
+          }
+          if (next_max_items != 0) {
+            int64_t continuation_min_items = next_can_be_empty ? 1 : next_min_items;
+            if (next_max_items != -1 && continuation_min_items > next_max_items) {
+              continue;
+            }
+            std::string next_sequence =
+                build_contains_sequence(next_mask, continuation_min_items, next_max_items);
+            append_option(
+                EBNFScriptCreator::Concat({subset_rule_name, mid_separator, next_sequence})
+            );
+          }
         }
       }
 
@@ -5555,8 +7105,7 @@ std::string JSONSchemaConverter::GenerateArray(
       return sequence_rule_name;
     };
 
-    std::string sequence_rule =
-        build_contains_sequence(sequence_min_items, sequence_max_items);
+    std::string sequence_rule = build_contains_sequence(0, sequence_min_items, sequence_max_items);
     return EBNFScriptCreator::Concat(
         {left_bracket, start_separator, sequence_rule, end_separator, right_bracket}
     );
@@ -6138,8 +7687,8 @@ std::string JSONSchemaConverter::GenerateEnum(const EnumSpec& spec, const std::s
 
 std::string JSONSchemaConverter::GenerateRef(const RefSpec& spec, const std::string& rule_name) {
   // First check if we have a direct URI mapping (for circular references)
-  if (uri_to_rule_name_.count(spec.uri)) {
-    return uri_to_rule_name_[spec.uri];
+  if (auto it = uri_to_rule_name_.find(spec.uri); it != uri_to_rule_name_.end()) {
+    return it->second;
   }
 
   if (!ref_resolver_) {
@@ -6587,15 +8136,32 @@ std::string JSONSchemaConverter::GenerateRangeRegex(
 ) {
   std::vector<std::string> parts;
   std::ostringstream result;
+  constexpr int64_t kInt64Min = std::numeric_limits<int64_t>::min();
+
+  auto append_negative_closed_range = [&](int64_t negative_lower, int64_t negative_upper) {
+    XGRAMMAR_DCHECK(negative_lower <= negative_upper && negative_upper <= -1);
+    if (negative_lower == kInt64Min) {
+      parts.push_back(std::to_string(kInt64Min));
+      if (negative_upper == kInt64Min) {
+        return;
+      }
+      negative_lower = kInt64Min + 1;
+    }
+    parts.push_back("-" + GenerateSubRangeRegex(-negative_upper, -negative_lower));
+  };
 
   if (!start && !end) {
     return "^-?\\d+$";
   }
 
+  if (start && end && start.value() == kInt64Min && end.value() == kInt64Min) {
+    return "^-9223372036854775808$";
+  }
+
   if (start && !end) {
     if (start.value() <= 0) {
       if (start.value() < 0) {
-        parts.push_back("-" + GenerateSubRangeRegex(-(-start.value()), 1));
+        append_negative_closed_range(start.value(), -1);
       }
       parts.push_back("0");
       parts.push_back("[1-9]\\d*");
@@ -6640,6 +8206,11 @@ std::string JSONSchemaConverter::GenerateRangeRegex(
         parts.push_back(GenerateSubRangeRegex(1, end.value()));
       }
     } else {
+      if (end.value() == kInt64Min) {
+        parts.push_back(std::to_string(kInt64Min));
+        result << "^(" << parts[0] << ")$";
+        return result.str();
+      }
       std::string end_str = std::to_string(-end.value());
       int len = static_cast<int>(end_str.length());
 
@@ -6683,7 +8254,7 @@ std::string JSONSchemaConverter::GenerateRangeRegex(
     if (range_start < 0) {
       int64_t neg_start = range_start;
       int64_t neg_end = std::min(static_cast<int64_t>(-1), range_end);
-      parts.push_back("-" + GenerateSubRangeRegex(-neg_end, -neg_start));
+      append_negative_closed_range(neg_start, neg_end);
     }
 
     if (range_start <= 0 && range_end >= 0) {
@@ -6709,7 +8280,13 @@ std::string JSONSchemaConverter::GenerateRangeRegex(
 }
 
 std::string JSONSchemaConverter::FormatFloat(double value, int precision) {
-  if (value == static_cast<int64_t>(value)) {
+  static const double MAX_INT64_AS_DOUBLE =
+      static_cast<double>(std::numeric_limits<int64_t>::max());
+  static const double MIN_INT64_AS_DOUBLE =
+      static_cast<double>(std::numeric_limits<int64_t>::min());
+
+  if (value >= MIN_INT64_AS_DOUBLE && value < MAX_INT64_AS_DOUBLE &&
+      value == static_cast<int64_t>(value)) {
     return std::to_string(static_cast<int64_t>(value));
   }
 
@@ -6749,16 +8326,26 @@ std::string JSONSchemaConverter::GenerateFloatRangeRegex(
   double endFrac = 0.0;
   bool isStartNegative = false;
   bool isEndNegative = false;
+  static const double MAX_INT64_AS_DOUBLE =
+      static_cast<double>(std::numeric_limits<int64_t>::max());
+  static const double MIN_INT64_AS_DOUBLE =
+      static_cast<double>(std::numeric_limits<int64_t>::min());
 
   if (start) {
     isStartNegative = start.value() < 0;
-    startInt = static_cast<int64_t>(floor(start.value()));
+    double floored = floor(start.value());
+    XGRAMMAR_CHECK(floored >= MIN_INT64_AS_DOUBLE && floored < MAX_INT64_AS_DOUBLE)
+        << "Number range exceeds int64 conversion limit";
+    startInt = static_cast<int64_t>(floored);
     startFrac = start.value() - startInt;
   }
 
   if (end) {
     isEndNegative = end.value() < 0;
-    endInt = static_cast<int64_t>(floor(end.value()));
+    double floored = floor(end.value());
+    XGRAMMAR_CHECK(floored >= MIN_INT64_AS_DOUBLE && floored < MAX_INT64_AS_DOUBLE)
+        << "Number range exceeds int64 conversion limit";
+    endInt = static_cast<int64_t>(floored);
     endFrac = end.value() - endInt;
   }
 

@@ -12,6 +12,7 @@
 #include "fsm_builder.h"
 #include "grammar_functor.h"
 #include "support/encoding.h"
+#include "test_utils.h"
 #include "xgrammar/grammar.h"
 
 using namespace xgrammar;
@@ -426,4 +427,20 @@ TEST(XGrammarFSMBuilderTest, TestChoicesFSMBuilder) {
 
   EXPECT_TRUE(fsm_rule2_result.has_value());
   EXPECT_EQ(fsm_rule2_result->ToString(), expected_fsm_rule2);
+}
+
+TEST(XGrammarFSMBuilderTest, TestRegexBuilderRejectsTrailingEscape) {
+  XGRAMMAR_EXPECT_THROW(
+      std::move(RegexFSMBuilder::Build("\\")).Unwrap(), std::exception, "Invalid escape sequence"
+  );
+}
+
+TEST(XGrammarFSMBuilderTest, TestRegexBuilderRejectsIncompleteRepeatRange) {
+  auto missing_close = RegexFSMBuilder::Build("a{1");
+  ASSERT_TRUE(missing_close.IsErr());
+  EXPECT_THAT(std::move(missing_close).UnwrapErr().what(), ::testing::ContainsRegex("Invalid repeat format3"));
+
+  auto missing_upper = RegexFSMBuilder::Build("a{1,");
+  ASSERT_TRUE(missing_upper.IsErr());
+  EXPECT_THAT(std::move(missing_upper).UnwrapErr().what(), ::testing::ContainsRegex("Invalid repeat format4"));
 }

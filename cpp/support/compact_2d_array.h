@@ -7,6 +7,7 @@
 
 #include <picojson.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -90,7 +91,7 @@ class Compact2DArray {
   /****************** Accessors ******************/
 
   /*! \brief Get the number of rows in the Compact2DArray. */
-  int32_t size() const { return static_cast<int32_t>(indptr_.size()) - 1; }
+  int32_t size() const { return std::max<int32_t>(0, static_cast<int32_t>(indptr_.size()) - 1); }
 
   friend std::size_t MemorySize(const Compact2DArray<DataType>& arr) {
     return MemorySize(arr.data_) + MemorySize(arr.indptr_);
@@ -155,6 +156,8 @@ class Compact2DArray {
    * \param cnt The number of rows to be popped.
    */
   void PopBack(const int32_t& cnt) {
+    XGRAMMAR_CHECK(cnt >= 0 && cnt <= size()) << "PopBack count " << cnt << " is out of range [0, "
+                                              << size() << "]";
     indptr_.erase(indptr_.end() - cnt, indptr_.end());
     data_.erase(data_.begin() + indptr_.back(), data_.end());
     return;
@@ -203,7 +206,19 @@ inline int32_t Compact2DArray<DataType>::PushBack(const DataType* new_data, int3
   // TODO(yixin): whether to add a additional data_len
   // If the new data is already in the Compact2DArray, we need to copy it to the new memory
   // location.
-  if (new_data >= data_.data() && new_data < data_.data() + data_.size()) {
+  XGRAMMAR_CHECK(new_data_len >= 0) << "new_data_len " << new_data_len << " cannot be negative";
+  auto overlaps_storage = [&](const DataType* ptr, int32_t len) {
+    if (ptr == nullptr || len <= 0 || data_.empty()) {
+      return false;
+    }
+    auto src_begin = reinterpret_cast<std::uintptr_t>(ptr);
+    auto src_end = src_begin + static_cast<std::uintptr_t>(len) * sizeof(DataType);
+    auto storage_begin = reinterpret_cast<std::uintptr_t>(data_.data());
+    auto storage_end =
+        storage_begin + static_cast<std::uintptr_t>(data_.size()) * sizeof(DataType);
+    return src_begin < storage_end && src_end > storage_begin;
+  };
+  if (overlaps_storage(new_data, new_data_len)) {
     std::vector<DataType> new_data_copied(new_data, new_data + new_data_len);
     data_.insert(data_.end(), new_data_copied.begin(), new_data_copied.end());
   } else {
@@ -224,7 +239,19 @@ template <typename DataType>
 inline int32_t Compact2DArray<DataType>::PushBackNonContiguous(
     DataType data_1, const DataType* data_2, int32_t data_2_len
 ) {
-  if (data_2 >= data_.data() && data_2 < data_.data() + data_.size()) {
+  XGRAMMAR_CHECK(data_2_len >= 0) << "data_2_len " << data_2_len << " cannot be negative";
+  auto overlaps_storage = [&](const DataType* ptr, int32_t len) {
+    if (ptr == nullptr || len <= 0 || data_.empty()) {
+      return false;
+    }
+    auto src_begin = reinterpret_cast<std::uintptr_t>(ptr);
+    auto src_end = src_begin + static_cast<std::uintptr_t>(len) * sizeof(DataType);
+    auto storage_begin = reinterpret_cast<std::uintptr_t>(data_.data());
+    auto storage_end =
+        storage_begin + static_cast<std::uintptr_t>(data_.size()) * sizeof(DataType);
+    return src_begin < storage_end && src_end > storage_begin;
+  };
+  if (overlaps_storage(data_2, data_2_len)) {
     std::vector<DataType> new_data_copied(data_2, data_2 + data_2_len);
     data_.push_back(data_1);
     data_.insert(data_.end(), new_data_copied.begin(), new_data_copied.end());

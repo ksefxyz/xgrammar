@@ -28,6 +28,9 @@ using GrammarExpr = Grammar::Impl::GrammarExpr;
 bool EarleyParser::IsCompleted() const { return is_completed_.back(); }
 
 void EarleyParser::PopLastStates(int32_t cnt) {
+  if (cnt == 0) {
+    return;
+  }
   if (stop_token_is_accepted_) {
     stop_token_is_accepted_ = false;
   }
@@ -686,7 +689,7 @@ void EarleyParser::AdvanceCharacterClass(
   }
 
   // Handle non-ASCII first bytes
-  if (!isascii(ch)) {
+  if (ch >= 128) {
     auto [accepted, num_bytes, partial] = HandleUTF8FirstByte(ch);
     if (!accepted) {
       return;
@@ -725,8 +728,7 @@ void EarleyParser::AdvanceCharacterClass(
 
   // ASCII handling (unchanged)
   for (int i = 1; i < sub_sequence.size(); i += 2) {
-    if (static_cast<uint8_t>(sub_sequence[i]) <= ch &&
-        ch <= static_cast<uint8_t>(sub_sequence[i + 1])) {
+    if (sub_sequence[i] <= ch && ch <= sub_sequence[i + 1]) {
       if (!is_negative) {
         auto new_state = state;
         new_state.element_id++;
@@ -819,7 +821,7 @@ void EarleyParser::AdvanceCharacterClassStar(
   }
 
   // Handle non-ASCII first bytes
-  if (!isascii(ch)) {
+  if (ch >= 128) {
     auto [accepted, num_bytes, partial] = HandleUTF8FirstByte(ch);
     if (!accepted) {
       return;
@@ -858,8 +860,7 @@ void EarleyParser::AdvanceCharacterClassStar(
 
   // ASCII handling (unchanged)
   for (int i = 1; i < sub_sequence.size(); i += 2) {
-    if (static_cast<uint8_t>(sub_sequence[i]) <= ch &&
-        ch <= static_cast<uint8_t>(sub_sequence[i + 1])) {
+    if (sub_sequence[i] <= ch && ch <= sub_sequence[i + 1]) {
       if (!is_negative) {
         Enqueue(state);
       }

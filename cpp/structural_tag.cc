@@ -1318,8 +1318,10 @@ std::optional<ISTError> StructuralTagTokenResolver::ResolveFormat(Format* format
             if (err) return err;
           }
           return std::nullopt;
-        } else if constexpr (std::is_same_v<T, OptionalFormat> || std::is_same_v<T, PlusFormat> ||
-                             std::is_same_v<T, StarFormat>) {
+        } else if constexpr (
+            std::is_same_v<T, OptionalFormat> || std::is_same_v<T, PlusFormat> ||
+            std::is_same_v<T, StarFormat> || std::is_same_v<T, RepeatFormat>
+        ) {
           return ResolveFormat(arg.content.get());
         } else {
           return std::nullopt;

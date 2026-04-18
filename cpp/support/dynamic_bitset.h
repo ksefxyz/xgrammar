@@ -89,7 +89,7 @@ class DynamicBitset {
 
   /*! \brief Copy assignment. */
   DynamicBitset& operator=(const DynamicBitset& other) {
-    XGRAMMAR_DCHECK(is_internal_ || size_ >= other.size_)
+    XGRAMMAR_CHECK(is_internal_ || size_ >= other.size_)
         << "Expanding bitset size is not allowed when the "
            "memory of the bitset is externally managed";
     size_ = other.size_;
@@ -106,14 +106,23 @@ class DynamicBitset {
 
   /*! \brief Move assignment. */
   DynamicBitset& operator=(DynamicBitset&& other) noexcept {
-    size_ = other.size_;
-    buffer_size_ = other.buffer_size_;
-    is_internal_ = other.is_internal_;
-    if (is_internal_) {
-      internal_buffer_ = std::move(other.internal_buffer_);
-      data_ = internal_buffer_.data();
-    } else {
-      data_ = other.data_;
+    if (this != &other) {
+      size_ = other.size_;
+      buffer_size_ = other.buffer_size_;
+      is_internal_ = other.is_internal_;
+      if (is_internal_) {
+        internal_buffer_ = std::move(other.internal_buffer_);
+        data_ = internal_buffer_.data();
+      } else {
+        internal_buffer_.clear();
+        data_ = other.data_;
+      }
+
+      other.size_ = 0;
+      other.buffer_size_ = 0;
+      other.data_ = nullptr;
+      other.internal_buffer_.clear();
+      other.is_internal_ = true;
     }
     return *this;
   }
@@ -137,10 +146,11 @@ class DynamicBitset {
   /*! \brief Set the bit at the given index to the given value. */
   void Set(int index, bool value = true) {
     XGRAMMAR_DCHECK(data_ && index >= 0 && index < size_);
+    uint32_t mask = static_cast<uint32_t>(1) << (index % 32);
     if (value) {
-      data_[index / 32] |= 1 << (index % 32);
+      data_[index / 32] |= mask;
     } else {
-      data_[index / 32] &= ~(1 << (index % 32));
+      data_[index / 32] &= ~mask;
     }
   }
 
@@ -255,6 +265,9 @@ class DynamicBitset {
       return ConstructDeserializeError(
           "Invalid buffer_size. Buffer size should be ceil(size / 32)", type_name
       );
+    }
+    if (arr.size() < static_cast<size_t>(buffer_size + 2)) {
+      return ConstructDeserializeError("Except enough uint32 words for the buffer", type_name);
     }
 
     DynamicBitset result(size);

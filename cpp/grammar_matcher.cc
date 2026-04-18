@@ -132,6 +132,9 @@ void ApplyMask32Bits(
   float* logits_data = GetTensorDataWithByteOffset<float>(*logits);
   if (indices.has_value()) {
     for (auto idx : indices.value()) {
+      XGRAMMAR_CHECK(idx >= 0 && idx < logits_shape.first && idx < bitmask_shape.first)
+          << "Index " << idx << " is out of range for logits batch size " << logits_shape.first
+          << " and bitmask batch size " << bitmask_shape.first;
       uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
       auto logits_ptr = logits_data + idx * logits_stride0;
@@ -187,6 +190,9 @@ void ApplyMask16Bits(
   uint16_t* logits_data = GetTensorDataWithByteOffset<uint16_t>(*logits);
   if (indices.has_value()) {
     for (auto idx : indices.value()) {
+      XGRAMMAR_CHECK(idx >= 0 && idx < logits_shape.first && idx < bitmask_shape.first)
+          << "Index " << idx << " is out of range for logits batch size " << logits_shape.first
+          << " and bitmask batch size " << bitmask_shape.first;
       uint32_t* data_ptr = bitmask_data + idx * bitmask_stride0;
       DynamicBitset bitset(vocab_size, data_ptr);
       auto logits_ptr = logits_data + idx * logits_stride0;
@@ -458,24 +464,24 @@ class GrammarMatcher::Impl : public EarleyParser {
 class BatchGrammarMatcher::Impl {
  public:
   Impl(std::variant<std::string, int32_t> max_threads) {
+    int32_t available_threads =
+        std::max<int32_t>(1, static_cast<int32_t>(std::thread::hardware_concurrency()));
     if (std::holds_alternative<int32_t>(max_threads)) {
       int32_t num_threads = std::get<int32_t>(max_threads);
       XGRAMMAR_CHECK(num_threads >= 1)
           << "The num_threads should be at least 1, but got " << num_threads;
       if (num_threads > 1) {
-        if (num_threads > static_cast<int32_t>(std::thread::hardware_concurrency())) {
+        if (num_threads > available_threads) {
           XGRAMMAR_LOG(WARNING) << "The num_threads " << num_threads << " is larger than the "
                                 << "number of hardware threads. Using "
-                                << static_cast<int32_t>(std::thread::hardware_concurrency())
-                                << " instead.";
+                                << available_threads << " instead.";
         }
-        max_threads_ =
-            std::min(num_threads, static_cast<int32_t>(std::thread::hardware_concurrency()));
+        max_threads_ = std::min(num_threads, available_threads);
       }
     } else {
       std::string str = std::get<std::string>(max_threads);
       XGRAMMAR_CHECK(str == "auto");
-      max_threads_ = std::thread::hardware_concurrency() / 2;
+      max_threads_ = std::max<int32_t>(1, available_threads / 2);
     }
   }
 
@@ -759,12 +765,13 @@ bool GrammarMatcher::Impl::FillNextTokenBitmask(
   }
 
   std::vector<std::pair<ParserState, const AdaptiveTokenMask*>> latest_states_with_masks;
+  latest_states_with_masks.reserve(latest_states.size());
 
   for (const auto& state : latest_states) {
     auto adaptive_token_mask_it = adaptive_token_mask_cache.find(state);
     XGRAMMAR_CHECK(adaptive_token_mask_it != adaptive_token_mask_cache.end()) << state;
     const auto& adaptive_token_mask = adaptive_token_masks[adaptive_token_mask_it->second];
-    latest_states_with_masks.push_back(std::make_pair(state, &adaptive_token_mask));
+    latest_states_with_masks.emplace_back(state, &adaptive_token_mask);
     if (adaptive_token_mask.store_type == StoreType::kAcceptedBitset) {
       tmp_accepted_bitset_ |= adaptive_token_mask.accepted_bitset;
     } else if (adaptive_token_mask.store_type == StoreType::kAccepted) {
@@ -909,6 +916,7 @@ std::string GrammarMatcher::Impl::FindJumpForwardString() {
       const auto& current_edges = fsm.GetFsm().GetEdges(state.element_id);
       for (const auto& edge : current_edges) {
         if (!edge.IsCharRange()) {
+          can_find_next_char = false;
           continue;
         }
         if (edge.min != edge.max) {
@@ -921,6 +929,9 @@ std::string GrammarMatcher::Impl::FindJumpForwardString() {
           can_find_next_char = false;
           break;
         }
+      }
+      if (!can_find_next_char) {
+        break;
       }
     }
 

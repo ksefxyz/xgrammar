@@ -93,3 +93,6 @@ class XGRObject:
         if not isinstance(other, XGRObject):
             return NotImplemented
         return self._handle == other._handle
+
+    def __hash__(self) -> int:
+        return hash(self._handle)

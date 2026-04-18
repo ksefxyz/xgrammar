@@ -1,7 +1,9 @@
 """This test uses the optimized JSON grammar provided by the grammar library."""
 
 import sys
+import sys
 import time
+import types
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -193,6 +195,28 @@ def test_apply_token_bitmask_inplace_kernel(impl: str, num_parallel_threads: int
         torch.testing.assert_close(logits, expected)
 
 
+def test_apply_token_bitmask_inplace_triton_without_gcn_arch_name(monkeypatch):
+    module = pytest.importorskip("xgrammar.kernels.apply_token_bitmask_inplace_triton")
+
+    class _FakeProps:
+        multi_processor_count = 1
+
+    class _FakeKernel:
+        def __getitem__(self, grid):
+            def _launch(*args, **kwargs):
+                return None
+
+            return _launch
+
+    monkeypatch.setattr(module.torch.cuda, "get_device_properties", lambda *_args, **_kwargs: _FakeProps())
+    monkeypatch.setattr(module, "apply_token_bitmask_inplace_kernel", _FakeKernel())
+
+    logits = torch.zeros((1, 10), dtype=torch.float32)
+    bitmask = torch.full((1, 1), -1, dtype=torch.int32)
+
+    module.apply_token_bitmask_inplace_triton(logits, bitmask)
+
+
 batch_size__vocab_size__masked_cnt__stride__logits_dtype = [
     (1, 128000, 1024, 1, "float32"),
     (1, 128000, 120000, 1, "float32"),
@@ -293,14 +317,14 @@ logits_shape__bitmask_shape__vocab_size = [
 @pytest.mark.parametrize(
     "logits_shape, bitmask_shape, vocab_size", logits_shape__bitmask_shape__vocab_size
 )
-@pytest.mark.parametrize("impl", ("cpu", "triton", "torch_compile"))
+@pytest.mark.parametrize("impl", ("cpu", "cuda", "triton", "torch_compile"))
 def test_apply_token_bitmask_inplace_vocab_size(
     logits_shape: Tuple[int, int],
     bitmask_shape: Tuple[int, int],
     vocab_size: Optional[int],
     impl: str,
 ):
-    if impl in ["triton", "torch_compile"] and not _is_cuda_available:
+    if impl in ["cuda", "triton", "torch_compile"] and not _is_cuda_available:
         pytest.skip(reason="CUDA is not installed")
 
     kernel = get_apply_token_bitmask_kernel(impl)
@@ -314,7 +338,7 @@ def test_apply_token_bitmask_inplace_vocab_size(
     logits_expected = logits.clone()
     logits_expected[..., :vocab_size] = float("-inf")
 
-    if impl in ["triton", "torch_compile"]:
+    if impl in ["cuda", "triton", "torch_compile"]:
         logits_gpu = logits.to("cuda")
         bitmask_gpu = bitmask.to("cuda")
         kernel(logits_gpu, bitmask_gpu, vocab_size=vocab_size)
@@ -363,6 +387,62 @@ def test_apply_token_bitmask_inplace_indices(
         assert impl == "cpu"
         kernel(logits, bitmask, indices=indices)
         torch.testing.assert_close(logits, logits_expected)
+
+
+def test_apply_token_bitmask_inplace_cuda_backend_forwards_vocab_size(monkeypatch):
+    called = {}
+
+    def fake_apply_token_bitmask_inplace_cuda(logits, bitmask, vocab_size=None, indices=None):
+        called["vocab_size"] = vocab_size
+        called["indices"] = indices
+
+    fake_module = types.ModuleType("xgrammar.kernels.apply_token_bitmask_inplace_cuda")
+    fake_module.apply_token_bitmask_inplace_cuda = fake_apply_token_bitmask_inplace_cuda
+    monkeypatch.setitem(
+        sys.modules, "xgrammar.kernels.apply_token_bitmask_inplace_cuda", fake_module
+    )
+
+    logits = torch.ones((1, 8), dtype=torch.float32)
+    bitmask = torch.full((1, 1), -1, dtype=torch.int32)
+    xgr.apply_token_bitmask_inplace(logits, bitmask, vocab_size=7, backend="cuda")
+
+    assert called == {"vocab_size": 7, "indices": None}
+
+
+def test_apply_token_bitmask_inplace_indices_out_of_range_cpu():
+    logits = torch.ones((1, 32), dtype=torch.float32)
+    bitmask = torch.full((1, 1), -1, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="Index 1 is out of range"):
+        xgr.apply_token_bitmask_inplace(logits, bitmask, indices=[1], backend="cpu")
+
+    with pytest.raises(RuntimeError, match="Index -1 is out of range"):
+        xgr.apply_token_bitmask_inplace(logits, bitmask, indices=[-1], backend="cpu")
+
+
+def test_apply_token_bitmask_inplace_indices_out_of_range_cpu_bfloat16():
+    logits = torch.ones((1, 32), dtype=torch.bfloat16)
+    bitmask = torch.full((1, 1), -1, dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="Index 1 is out of range"):
+        xgr.apply_token_bitmask_inplace(logits, bitmask, indices=[1], backend="cpu")
+
+
+def test_apply_token_bitmask_inplace_cuda_handles_non_aligned_vocab_tail():
+    if not _is_cuda_available:
+        pytest.skip(reason="CUDA is not installed")
+
+    kernel = get_apply_token_bitmask_kernel("cuda")
+    vocab_size = 32001
+    logits = torch.ones((1, vocab_size), dtype=torch.float16, device="cuda")
+    bool_mask = torch.ones((1, vocab_size), dtype=torch.bool, device="cpu")
+    bool_mask[0, -1] = False
+    bitmask = bool_mask_to_bitmask(bool_mask).to("cuda")
+
+    kernel(logits, bitmask, vocab_size=vocab_size)
+
+    assert torch.isneginf(logits[0, -1])
+    torch.testing.assert_close(logits[0, -8:-1], torch.ones(7, dtype=torch.float16, device="cuda"))
 
 
 def test_bitmask_to_boolmask():

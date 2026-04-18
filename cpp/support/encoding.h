@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -141,7 +142,9 @@ std::pair<TCodepoint, int32_t> ParseNextUTF8OrEscaped(
 /******************** Implementation ********************/
 
 inline std::string CharToUTF8(TCodepoint codepoint) {
-  XGRAMMAR_DCHECK(codepoint <= 0x10FFFF) << "Invalid codepoint: " << codepoint;
+  XGRAMMAR_CHECK(
+      codepoint >= 0 && codepoint <= 0x10FFFF && !(codepoint >= 0xD800 && codepoint <= 0xDFFF)
+  ) << "Invalid codepoint: " << codepoint;
   std::string utf8;
   if (codepoint <= 0x7F) {
     // 1-byte sequence
@@ -400,9 +403,12 @@ std::pair<TCodepoint, int32_t> ParseNextEscaped(
   if (data[0] != '\\') {
     return {CharHandlingError::kInvalidEscape, 0};
   }
+  if (data[1] == static_cast<CharType>('\0')) {
+    return {CharHandlingError::kInvalidEscape, 0};
+  }
 
   bool escape_char_in_escape_range =
-      static_cast<int32_t>(static_cast<unsigned char>(data[1])) <= 128;
+      static_cast<int32_t>(static_cast<unsigned char>(data[1])) < 128;
   if (!escape_char_in_escape_range) {
     return {CharHandlingError::kInvalidEscape, 0};
   }
@@ -422,6 +428,12 @@ std::pair<TCodepoint, int32_t> ParseNextEscaped(
     TCodepoint codepoint = 0;
     int32_t digit;
     while ((digit = HexCharToInt(data[2 + len])) != -1) {
+      if (
+          codepoint >
+          (std::numeric_limits<TCodepoint>::max() - digit) / static_cast<TCodepoint>(16)
+      ) {
+        return {CharHandlingError::kInvalidEscape, 0};
+      }
       codepoint = codepoint * 16 + digit;
       ++len;
     }

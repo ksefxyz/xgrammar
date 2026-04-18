@@ -11,27 +11,50 @@ import type {
 export { StructuralTagItemImpl as StructuralTagItem };
 export type {
   AnyTextFormat,
+  AnyTokensFormat,
   ConstStringFormat,
+  DispatchFormat,
+  ExcludeTokenFormat,
   GrammarFormat,
   JSONSchemaFormat,
+  OptionalFormat,
   QwenXMLParameterFormat,
+  PlusFormat,
   RegexFormat,
+  RepeatFormat,
   SequenceFormat,
+  StarFormat,
   StructuralTag,
   StructuralTagFormat,
   StructuralTagLike,
   TagFormat,
+  TokenDispatchFormat,
+  TokenFormat,
+  TokenTriggeredTagsFormat,
   TagsWithSeparatorFormat,
   TriggeredTagsFormat,
   OrFormat,
 } from "./structural_tag.js";
 
 let binding: any = null;
+let bindingPromise: Promise<any> | null = null;
 
 async function asyncInitBinding() {
-  if (binding == null) {
-    binding = await Module();
+  if (binding != null) {
+    return;
   }
+  if (bindingPromise == null) {
+    bindingPromise = Module()
+      .then((instance) => {
+        binding = instance;
+        return instance;
+      })
+      .catch((error) => {
+        bindingPromise = null;
+        throw error;
+      });
+  }
+  await bindingPromise;
 }
 
 type SeparatorPair = { first: string; second: string };
@@ -401,23 +424,24 @@ export class TokenizerInfo {
     stopTokenIds?: number[] | number,
   ): Promise<TokenizerInfo> {
     await asyncInitBinding();
-    // Convert string[] to std::vector<std::string>
     const encodedVocabVec = binding.vecStringFromJSArray(encodedVocab);
-    // Convert stopTokenIds to std::vector<int> if not undefined
-    if (stopTokenIds !== undefined) {
-      if (!Array.isArray(stopTokenIds)) {
-        stopTokenIds = [stopTokenIds];
+    let stopTokenIdsVec: any = undefined;
+    try {
+      if (stopTokenIds !== undefined) {
+        const stopTokenIdsArray = Array.isArray(stopTokenIds) ? stopTokenIds : [stopTokenIds];
+        stopTokenIdsVec = binding.vecIntFromJSArray(stopTokenIdsArray);
       }
-      stopTokenIds = binding.vecIntFromJSArray(stopTokenIds);
+      return new TokenizerInfo(new binding.TokenizerInfo(
+        encodedVocabVec,
+        vocabType.toUpperCase(),
+        vocabSize,
+        stopTokenIdsVec,
+        prependSpaceInTokenization,
+      ));
+    } finally {
+      encodedVocabVec.delete();
+      stopTokenIdsVec?.delete();
     }
-    // Instantiate TokenizerInfo
-    return new TokenizerInfo(new binding.TokenizerInfo(
-      encodedVocabVec,
-      vocabType.toUpperCase(),
-      vocabSize,
-      stopTokenIds,
-      prependSpaceInTokenization,
-    ));
   }
 }
 
@@ -567,7 +591,11 @@ export class GrammarCompiler {
     await asyncInitBinding();
     if (typeof grammar === "string") {
       const grammarObj = await Grammar.fromEBNF(grammar, rootRule);
-      return new CompiledGrammar(this.handle.CompileGrammar(grammarObj.handle));
+      try {
+        return new CompiledGrammar(this.handle.CompileGrammar(grammarObj.handle));
+      } finally {
+        grammarObj.dispose();
+      }
     } else {
       return new CompiledGrammar(this.handle.CompileGrammar(grammar.handle));
     }
@@ -608,6 +636,7 @@ export class GrammarCompiler {
 export class GrammarMatcher {
   private handle: any;
   private vocab_size: number;
+  private fullyAcceptedBitmask: Int32Array | null;
 
   /**
    * @internal
@@ -617,6 +646,7 @@ export class GrammarMatcher {
   private constructor(handle: any, vocab_size: number) {
     this.handle = handle;
     this.vocab_size = vocab_size;
+    this.fullyAcceptedBitmask = null;
   }
 
   /**
@@ -641,19 +671,26 @@ export class GrammarMatcher {
     maxRollbackTokens: number = -1,
   ): Promise<GrammarMatcher> {
     await asyncInitBinding();
-    // Convert overrideStopTokens to std::vector<int> if not undefined
-    if (overrideStopTokens !== undefined) {
-      if (!Array.isArray(overrideStopTokens)) {
-        overrideStopTokens = [overrideStopTokens];
+    let overrideStopTokensVec: any = undefined;
+    let tokenizerInfo: TokenizerInfo | undefined;
+    try {
+      if (overrideStopTokens !== undefined) {
+        const overrideStopTokensArray = Array.isArray(overrideStopTokens)
+          ? overrideStopTokens
+          : [overrideStopTokens];
+        overrideStopTokensVec = binding.vecIntFromJSArray(overrideStopTokensArray);
       }
-      overrideStopTokens = binding.vecIntFromJSArray(overrideStopTokens);
+      tokenizerInfo = compiledGrammar.tokenizerInfo();
+      return new GrammarMatcher(new binding.GrammarMatcher(
+        compiledGrammar.handle,
+        overrideStopTokensVec,
+        terminateWithoutStopToken,
+        maxRollbackTokens,
+      ), tokenizerInfo.getVocabSize());
+    } finally {
+      tokenizerInfo?.dispose();
+      overrideStopTokensVec?.delete();
     }
-    return new GrammarMatcher(new binding.GrammarMatcher(
-      compiledGrammar.handle,
-      overrideStopTokens,
-      terminateWithoutStopToken,
-      maxRollbackTokens,
-    ), compiledGrammar.tokenizerInfo().getVocabSize());
   }
 
   /**
@@ -691,11 +728,24 @@ export class GrammarMatcher {
    */
   async getNextTokenBitmask(): Promise<Int32Array> {
     await asyncInitBinding();
-    // a handle of std::vector<int32_t>
-    const maskIntVector = this.handle.GetNextTokenBitmask(this.vocab_size)
+    const bitmaskResult = this.handle.GetNextTokenBitmaskWithStatus(this.vocab_size);
+    const maskIntVector = bitmaskResult.bitmask;
+    if (!bitmaskResult.needsMasking) {
+      maskIntVector.delete();
+      return this.getFullyAcceptedBitmask();
+    }
     const maskInt32Array = binding.vecIntToView(maskIntVector).slice();
     maskIntVector.delete();
     return maskInt32Array;
+  }
+
+  private getFullyAcceptedBitmask(): Int32Array {
+    if (this.fullyAcceptedBitmask == null) {
+      const bitmaskSize = Math.ceil(this.vocab_size / 32);
+      this.fullyAcceptedBitmask = new Int32Array(bitmaskSize);
+      this.fullyAcceptedBitmask.fill(-1);
+    }
+    return this.fullyAcceptedBitmask.slice();
   }
 
   /**

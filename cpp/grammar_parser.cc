@@ -59,7 +59,17 @@ class EBNFLexer::Impl {
 };
 
 // Look at the next character
-inline char EBNFLexer::Impl::Peek(int delta) const { return *(cur_ + delta); }
+inline char EBNFLexer::Impl::Peek(int delta) const {
+  if (cur_ == nullptr) {
+    return '\0';
+  }
+  const char* begin = input_.c_str();
+  std::ptrdiff_t offset = (cur_ - begin) + static_cast<std::ptrdiff_t>(delta);
+  if (offset < 0 || offset >= static_cast<std::ptrdiff_t>(input_.size())) {
+    return '\0';
+  }
+  return begin[offset];
+}
 
 // Consume characters and update position information
 inline void EBNFLexer::Impl::Consume(int cnt) {

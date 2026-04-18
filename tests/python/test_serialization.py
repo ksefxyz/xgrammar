@@ -146,6 +146,14 @@ def test_serialize_tokenizer_info():
     assert json.loads(serialized) == json.loads(expected_json)
 
 
+def test_serialize_tokenizer_info_trie_prefix_ranges_do_not_use_substring_matches():
+    tokenizer_info = xgr.TokenizerInfo(["a", "ba"])
+    serialized = json.loads(tokenizer_info.serialize_json())
+
+    assert serialized["sorted_decoded_vocab"] == [[0, "a"], [1, "ba"]]
+    assert serialized["trie_subtree_nodes_range"] == [1, 2]
+
+
 def test_serialize_tokenizer_info_roundtrip():
     """Test TokenizerInfo serialization and deserialization roundtrip."""
     original_tokenizer_info = construct_tokenizer_info()
