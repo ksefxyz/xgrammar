@@ -281,4 +281,6 @@ int64_t XMLToolCallingConverter::GetCacheContext() const {
   return nested_object_level_ > 1 ? 1 : 0;
 }
 
+bool XMLToolCallingConverter::ShouldCacheCreatedRulesBySchemaKey() const { return false; }
+
 }  // namespace xgrammar

@@ -299,6 +299,9 @@ class EarleyParser {
   /*! \brief Check if the stop token is accepted. */
   bool stop_token_is_accepted_ = false;
 
+  /*! \brief Clear the accepted stop-token marker without mutating parser state history. */
+  void ClearAcceptedStopToken() { stop_token_is_accepted_ = false; }
+
   /*!
    * \brief Check if the state has been added into the queue.
    * \param state The state to check.

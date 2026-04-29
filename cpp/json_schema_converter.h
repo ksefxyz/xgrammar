@@ -352,6 +352,12 @@ class JSONSchemaConverter {
   /*! \brief Return the cache context for the current generation position. */
   virtual int64_t GetCacheContext() const;
 
+  /*!
+   * \brief Whether CreateRule should memoize newly created rules by schema cache key.
+   * \note Pre-populated cache entries are still consulted regardless of this setting.
+   */
+  virtual bool ShouldCacheCreatedRulesBySchemaKey() const;
+
   // ==================== Helper methods (for subclasses to use) ====================
 
   /*! \brief Dispatch to the appropriate Generate method based on spec type. */

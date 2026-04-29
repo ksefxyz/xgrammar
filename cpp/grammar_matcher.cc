@@ -958,7 +958,12 @@ void GrammarMatcher::Impl::Rollback(int num_tokens) {
       << token_length_history.size() << " steps of history are saved";
   while (num_tokens > 0) {
     int steps = token_length_history.back();
-    PopLastStates(steps);
+    if (steps == 0) {
+      // Zero-length history entries represent an accepted stop token.
+      ClearAcceptedStopToken();
+    } else {
+      PopLastStates(steps);
+    }
     token_length_history.pop_back();
     --num_tokens;
   }

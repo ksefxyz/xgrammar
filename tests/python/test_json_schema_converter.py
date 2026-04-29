@@ -1705,6 +1705,160 @@ def test_allof_discriminator_family_is_compacted_without_losing_semantics():
     )
 
 
+def test_allof_discriminator_family_with_contains_can_restrict_nested_oneof_branch():
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "Fa": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "RodzajFaktury": {"type": "string", "enum": ["VAT", "ZAL"]},
+                    "Adnotacje": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "Zwolnienie": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {
+                                            "P_19": {"const": 1},
+                                            "P_19A": {"type": "string"},
+                                        },
+                                        "required": ["P_19", "P_19A"],
+                                    },
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "properties": {"P_19N": {"const": 1}},
+                                        "required": ["P_19N"],
+                                    },
+                                ]
+                            }
+                        },
+                        "required": ["Zwolnienie"],
+                    },
+                    "FaWiersz": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "P_12": {"type": "string", "enum": ["23", "zw"]},
+                                "P_7": {"type": "string"},
+                            },
+                            "required": ["P_12", "P_7"],
+                        },
+                    },
+                    "Zamowienie": {"type": "string"},
+                },
+                "required": ["RodzajFaktury", "Adnotacje"],
+                "allOf": [
+                    {
+                        "if": {
+                            "properties": {"RodzajFaktury": {"const": "VAT"}},
+                            "required": ["RodzajFaktury"],
+                        },
+                        "then": {"required": ["FaWiersz"]},
+                    },
+                    {
+                        "if": {
+                            "properties": {"RodzajFaktury": {"const": "ZAL"}},
+                            "required": ["RodzajFaktury"],
+                        },
+                        "then": {
+                            "required": ["Zamowienie"],
+                            "not": {"required": ["FaWiersz"]},
+                        },
+                    },
+                    {
+                        "if": {
+                            "properties": {
+                                "FaWiersz": {
+                                    "type": "array",
+                                    "contains": {
+                                        "type": "object",
+                                        "properties": {"P_12": {"const": "zw"}},
+                                        "required": ["P_12"],
+                                    },
+                                }
+                            },
+                            "required": ["FaWiersz"],
+                        },
+                        "then": {
+                            "properties": {
+                                "Adnotacje": {
+                                    "type": "object",
+                                    "properties": {
+                                        "Zwolnienie": {
+                                            "type": "object",
+                                            "properties": {"P_19": {"const": 1}},
+                                            "required": ["P_19"],
+                                        }
+                                    },
+                                    "required": ["Zwolnienie"],
+                                }
+                            },
+                            "required": ["Adnotacje"],
+                        },
+                    },
+                ],
+            }
+        },
+        "required": ["Fa"],
+    }
+
+    check_schema_with_instance(
+        schema,
+        {
+            "Fa": {
+                "RodzajFaktury": "VAT",
+                "Adnotacje": {"Zwolnienie": {"P_19": 1, "P_19A": "basis"}},
+                "FaWiersz": [{"P_12": "zw", "P_7": "row"}],
+            }
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Fa": {
+                "RodzajFaktury": "VAT",
+                "Adnotacje": {"Zwolnienie": {"P_19N": 1}},
+                "FaWiersz": [{"P_12": "23", "P_7": "row"}],
+            }
+        },
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Fa": {
+                "RodzajFaktury": "VAT",
+                "Adnotacje": {"Zwolnienie": {"P_19N": 1}},
+                "FaWiersz": [{"P_12": "zw", "P_7": "row"}],
+            }
+        },
+        is_accepted=False,
+        any_whitespace=False,
+    )
+    check_schema_with_instance(
+        schema,
+        {
+            "Fa": {
+                "RodzajFaktury": "ZAL",
+                "Adnotacje": {"Zwolnienie": {"P_19N": 1}},
+                "Zamowienie": "zam",
+            }
+        },
+        any_whitespace=False,
+    )
+
+
 def test_if_then_else_anyof_required_alternatives():
     schema = {
         "type": "object",

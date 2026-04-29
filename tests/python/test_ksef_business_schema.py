@@ -162,7 +162,7 @@ CASES = {
         "expected": "VALID",
         "payload": {
             "Podmiot1": _seller_party(),
-            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "9876543210"}},
+            "Podmiot2": _buyer_nip(),
             "Fa": {
                 "RodzajFaktury": "UPR",
                 "P_2": "FV/1",
@@ -175,10 +175,11 @@ CASES = {
         "expected": "VALID",
         "payload": {
             "Podmiot1": _seller_party(),
-            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "9876543210"}},
+            "Podmiot2": _buyer_nip(),
             "Fa": {
                 "RodzajFaktury": "UPR",
                 "P_2": "FV/1",
+                "P_15": 100,
                 "FaWiersz": [_vat_row(include_p9a=True)],
                 "Platnosc": _payment_cash(),
             },
@@ -188,7 +189,7 @@ CASES = {
         "expected": "INVALID",
         "payload": {
             "Podmiot1": _seller_party(),
-            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "9876543210"}},
+            "Podmiot2": _buyer_nip(),
             "Fa": {"RodzajFaktury": "UPR", "P_2": "FV/1", "Platnosc": _payment_cash()},
         },
     },
@@ -196,7 +197,7 @@ CASES = {
         "expected": "INVALID",
         "payload": {
             "Podmiot1": _seller_party(),
-            "Podmiot2": {"DaneIdentyfikacyjne": {"Nazwa": "Buyer", "NIP": "9876543210"}},
+            "Podmiot2": _buyer_nip(),
             "Fa": {
                 "RodzajFaktury": "UPR",
                 "P_2": "FV/1",
@@ -582,6 +583,7 @@ CASE_KEYS = {
     "KursWalutyZK",
     "NrFaKorygowany",
     "OkresFaKorygowanej",
+    "P_15",
     "P_15ZK",
     "PrzyczynaKorekty",
     "RodzajFaktury",
@@ -613,7 +615,7 @@ def _baseline_payload():
         "Naglowek": {
             "KodFormularza": {"value": "FA"},
             "WariantFormularza": 3,
-            "DataWytworzeniaFa": "2026-04-14T10:00:00",
+            "DataWytworzeniaFa": "2026-04-14T10:00:00Z",
         },
         "Fa": {
             "KodWaluty": "PLN",
@@ -655,33 +657,29 @@ def _normalize_fa_structure(root):
     if not isinstance(fa, dict):
         return
 
-    case_block = copy.deepcopy(fa.get("_x_case", {}))
     sale_period_block = copy.deepcopy(fa.get("_x_sale_period", {}))
     tax_totals_block = copy.deepcopy(fa.get("_x_tax_totals", {}))
 
-    _move_matching_keys(fa, case_block, lambda key: key in CASE_KEYS)
     _move_matching_keys(fa, sale_period_block, lambda key: key in SALE_PERIOD_KEYS)
     _move_matching_keys(fa, tax_totals_block, lambda key: key.startswith("P_13_") or key.startswith("P_14_"))
 
-    if case_block:
-        fa["_x_case"] = case_block
     if sale_period_block:
         fa["_x_sale_period"] = sale_period_block
     if tax_totals_block:
         fa["_x_tax_totals"] = tax_totals_block
 
-    for index, item in enumerate(fa.get("_x_case", {}).get("FaWiersz", []), start=1):
+    for index, item in enumerate(fa.get("FaWiersz", []), start=1):
         item.setdefault("NrWierszaFa", index)
 
-    zamowienie = fa.get("_x_case", {}).get("Zamowienie")
+    zamowienie = fa.get("Zamowienie")
     if isinstance(zamowienie, dict) and "WartoscZamowienia" in zamowienie:
         zamowienie.setdefault("ZamowienieWiersz", [{"NrWierszaZam": 1}])
 
-    for item in fa.get("_x_case", {}).get("DaneFaKorygowanej", []):
+    for item in fa.get("DaneFaKorygowanej", []):
         if "NrKSeF" not in item and "NrKSeFN" not in item:
             item["NrKSeFN"] = 1
 
-    for item in fa.get("_x_case", {}).get("FakturaZaliczkowa", []):
+    for item in fa.get("FakturaZaliczkowa", []):
         if "NrKSeFFaZaliczkowej" not in item and "NrKSeFZN" not in item:
             item["NrKSeFZN"] = 1
 
@@ -740,19 +738,182 @@ def _normalize_case_payload(payload):
     return merged
 
 
+def _merge_required(left, right):
+    result = list(left or [])
+    for item in right or []:
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def _merge_schema_fragments(base, override):
+    if not isinstance(base, dict):
+        return copy.deepcopy(override)
+    if not isinstance(override, dict):
+        return copy.deepcopy(base)
+
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if key == "properties" and isinstance(result.get(key), dict) and isinstance(value, dict):
+            merged_properties = copy.deepcopy(result[key])
+            for prop_key, prop_value in value.items():
+                if prop_key in merged_properties:
+                    merged_properties[prop_key] = _merge_schema_fragments(
+                        merged_properties[prop_key], prop_value
+                    )
+                else:
+                    merged_properties[prop_key] = copy.deepcopy(prop_value)
+            result[key] = merged_properties
+        elif key == "required":
+            result[key] = _merge_required(result.get(key, []), value)
+        elif key in {"allOf", "anyOf", "oneOf"} and isinstance(result.get(key), list) and isinstance(value, list):
+            result[key] = copy.deepcopy(result[key]) + copy.deepcopy(value)
+        elif key == "items" and isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = _merge_schema_fragments(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _resolve_schema_ref(schema_root, ref):
+    if not ref.startswith("#/"):
+        raise ValueError(f"Unsupported schema ref: {ref}")
+
+    current = schema_root
+    for segment in ref[2:].split("/"):
+        segment = segment.replace("~1", "/").replace("~0", "~")
+        current = current[segment]
+    return current
+
+
+def _resolve_schema_node(schema_root, schema):
+    if not isinstance(schema, dict):
+        return schema
+
+    result = copy.deepcopy(schema)
+    while "$ref" in result:
+        target = _resolve_schema_ref(schema_root, result.pop("$ref"))
+        result = _merge_schema_fragments(target, result)
+    return result
+
+
+def _schema_const_mismatches(schema_root, schema, value):
+    if not isinstance(value, dict) or not isinstance(schema, dict):
+        return 0
+
+    mismatches = 0
+    for key, prop_schema in schema.get("properties", {}).items():
+        if key not in value:
+            continue
+        resolved_prop_schema = _resolve_schema_node(schema_root, prop_schema)
+        if isinstance(resolved_prop_schema, dict) and "const" in resolved_prop_schema:
+            if value[key] != resolved_prop_schema["const"]:
+                mismatches += 1
+    return mismatches
+
+
+def _effective_schema(schema_root, schema, value):
+    resolved = _resolve_schema_node(schema_root, schema)
+    if not isinstance(resolved, dict):
+        return resolved
+
+    result = copy.deepcopy(resolved)
+
+    if "allOf" in result:
+        for branch in result.pop("allOf"):
+            result = _merge_schema_fragments(result, _effective_schema(schema_root, branch, value))
+
+    for keyword in ("oneOf", "anyOf"):
+        if keyword not in result:
+            continue
+
+        branches = result.pop(keyword)
+        if isinstance(value, dict):
+            branch_scores = []
+            for index, branch in enumerate(branches):
+                effective_branch = _effective_schema(schema_root, branch, value)
+                branch_properties = (
+                    effective_branch.get("properties", {})
+                    if isinstance(effective_branch, dict)
+                    else {}
+                )
+                branch_required = (
+                    effective_branch.get("required", [])
+                    if isinstance(effective_branch, dict)
+                    else []
+                )
+                unknown_keys = 0
+                if (
+                    isinstance(effective_branch, dict)
+                    and effective_branch.get("additionalProperties") is False
+                ):
+                    unknown_keys = sum(1 for key in value if key not in branch_properties)
+
+                score = (
+                    _schema_const_mismatches(schema_root, effective_branch, value),
+                    sum(1 for key in branch_required if key not in value),
+                    unknown_keys,
+                    -sum(1 for key in value if key in branch_properties),
+                    index,
+                )
+                branch_scores.append((score, branch))
+            _, best_branch = min(branch_scores, key=lambda item: item[0])
+        else:
+            best_branch = branches[0]
+
+        result = _merge_schema_fragments(
+            result, _effective_schema(schema_root, best_branch, value)
+        )
+        break
+
+    return result
+
+
+def _canonicalize_payload_against_schema(value, schema, schema_root):
+    effective_schema = _effective_schema(schema_root, schema, value)
+
+    if isinstance(value, dict):
+        properties = (
+            effective_schema.get("properties", {})
+            if isinstance(effective_schema, dict)
+            else {}
+        )
+        ordered = {}
+        for key in properties:
+            if key in value:
+                ordered[key] = _canonicalize_payload_against_schema(
+                    value[key], properties[key], schema_root
+                )
+        for key, item in value.items():
+            if key not in ordered:
+                ordered[key] = copy.deepcopy(item)
+        return ordered
+
+    if isinstance(value, list):
+        if isinstance(effective_schema, dict) and "items" in effective_schema:
+            return [
+                _canonicalize_payload_against_schema(item, effective_schema["items"], schema_root)
+                for item in value
+            ]
+        return copy.deepcopy(value)
+
+    return copy.deepcopy(value)
+
+
 @lru_cache(maxsize=1)
 def _load_schema_and_grammar():
     schema_path = Path(__file__).resolve().parents[2] / "tmp" / "ksef_schema_business_source.json"
     schema = json.loads(schema_path.read_text())
-    grammar = xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=False)
+    grammar = xgr.Grammar.from_json_schema(json.dumps(schema), any_whitespace=True)
     return schema, grammar
 
 
 @pytest.mark.parametrize("case_name", list(CASES.keys()), ids=list(CASES.keys()))
 def test_ksef_business_cases(case_name):
-    _, grammar = _load_schema_and_grammar()
+    schema, grammar = _load_schema_and_grammar()
     case = CASES[case_name]
     payload = _normalize_case_payload(case["payload"])
+    payload = _canonicalize_payload_against_schema(payload, schema, schema)
     accepted = _is_grammar_accept_string(
         grammar, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )

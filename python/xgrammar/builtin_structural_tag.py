@@ -28,12 +28,14 @@ BuiltinSupportedModels = Literal[
     "glm47",
 ]
 
+_MISSING = object()
+
 
 def get_builtin_structural_tag(
     model: BuiltinSupportedModels,
     reasoning: bool = True,
-    tools: Optional[List[Dict[str, Any]]] = None,
-    builtin_tools: Optional[List[Dict[str, Any]]] = None,
+    tools: Optional[List[Dict[str, Any]]] | object = _MISSING,
+    builtin_tools: Optional[List[Dict[str, Any]]] | object = _MISSING,
     force_empty_reasoning: bool = False,
 ) -> StructuralTag:
     r"""Get structural tag for model. This function can generate structural tag for the given model
@@ -69,8 +71,14 @@ def get_builtin_structural_tag(
         raise ValueError("The 'reasoning' key in the input_dict must be a boolean.")
     if not isinstance(force_empty_reasoning, bool):
         raise ValueError("The 'force_empty_reasoning' key in the input_dict must be a boolean.")
-    tools = [] if tools is None else tools
-    builtin_tools = [] if builtin_tools is None else builtin_tools
+    if tools is _MISSING:
+        tools = []
+    elif tools is None:
+        raise ValueError("The 'tools' key in the input_dict must be a list.")
+    if builtin_tools is _MISSING:
+        builtin_tools = []
+    elif builtin_tools is None:
+        raise ValueError("The 'builtin_tools' key in the input_dict must be a list.")
     _validate_tool_function(tools)
     _validate_tool_function(builtin_tools)
 
